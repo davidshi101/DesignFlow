@@ -6,26 +6,28 @@ import { useRouter } from "next/navigation";
 import StageStepper from "@/components/StageStepper";
 import ApprovalBar from "@/components/ApprovalBar";
 import type { Asset } from "@/lib/store";
+import type { Print } from "@/lib/printStore";
 import { getFullChain } from "@/lib/chain";
-import {
-  clearMask,
-  floodFillToMask,
-  maskHasContent,
-} from "@/lib/floodFill";
-import {
-  BATCH_HUES,
-  BATCH_SCALES,
-  DEFAULT_CAD_CONTROLS,
-  PRINTS,
-  type CadControls,
-  type PrintId,
-} from "@/lib/prints";
+import { floodFillToMask, maskHasContent } from "@/lib/floodFill";
 
-interface VariantThumb {
+type Placement = "tile" | "single";
+
+interface SingleRect {
+  x: number; // logical px, center
+  y: number;
+  width: number;
+  height: number;
+}
+
+interface CadLayer {
   id: string;
-  dataUrl: string;
-  scale: number;
-  hue: number;
+  printId: string | null;
+  placement: Placement;
+  scale: number; // tile mode only
+  rotation: number; // both modes
+  hue: number; // both modes
+  mirrored: boolean; // both modes
+  single: SingleRect; // single mode only
 }
 
 interface SketchLayout {
@@ -37,6 +39,7 @@ interface SketchLayout {
 
 // Defensive upper bound only — Gemini caps real output around 1024x1024.
 const MAX_LOGICAL_DIM = 2048;
+const MIN_SINGLE_SIZE = 16;
 
 function loadImage(src: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
@@ -45,6 +48,15 @@ function loadImage(src: string): Promise<HTMLImageElement> {
     img.onload = () => resolve(img);
     img.onerror = () => reject(new Error(`Failed to load image: ${src}`));
     img.src = src;
+  });
+}
+
+function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = () => reject(new Error("Failed to read file"));
+    reader.readAsDataURL(file);
   });
 }
 
@@ -64,21 +76,124 @@ function fitSketch(
   };
 }
 
+/** Mirror + scale baked in; rotation is deliberately NOT baked in here — see
+ * buildRotatedTileLayer, which rotates the whole repeated sheet as one image
+ * instead of rotating the content inside each tile square. */
 function buildPrintTile(
   print: HTMLImageElement,
-  controls: CadControls
+  layer: CadLayer
 ): HTMLCanvasElement {
-  const tileSize = Math.max(24, Math.round(64 * controls.scale));
+  const tileSize = Math.max(24, Math.round(64 * layer.scale));
   const tile = document.createElement("canvas");
   tile.width = tileSize;
   tile.height = tileSize;
   const tctx = tile.getContext("2d")!;
   tctx.translate(tileSize / 2, tileSize / 2);
-  if (controls.mirrored) tctx.scale(-1, 1);
-  tctx.rotate((controls.rotation * Math.PI) / 180);
-  tctx.filter = `hue-rotate(${controls.hue}deg)`;
+  if (layer.mirrored) tctx.scale(-1, 1);
+  tctx.filter = `hue-rotate(${layer.hue}deg)`;
   tctx.drawImage(print, -tileSize / 2, -tileSize / 2, tileSize, tileSize);
   return tile;
+}
+
+/**
+ * Tile the pattern across an oversized square buffer, rotate that WHOLE
+ * sheet as one image, then crop the centered logical-size window back out.
+ * Oversizing first (with a small safety margin) guarantees the cropped
+ * window stays fully covered by pattern at any rotation angle — no blank
+ * corners, and no visible seams at tile boundaries since the grid itself
+ * rotates coherently rather than each tile square rotating individually.
+ */
+function buildRotatedTileLayer(
+  tile: HTMLCanvasElement,
+  rotationDeg: number,
+  logicalW: number,
+  logicalH: number
+): HTMLCanvasElement {
+  const side = Math.ceil(Math.hypot(logicalW, logicalH) * 1.1) || 1;
+
+  const sheet = document.createElement("canvas");
+  sheet.width = side;
+  sheet.height = side;
+  const sctx = sheet.getContext("2d")!;
+  const pattern = sctx.createPattern(tile, "repeat");
+  if (pattern) {
+    sctx.fillStyle = pattern;
+    sctx.fillRect(0, 0, side, side);
+  }
+
+  const rotated = document.createElement("canvas");
+  rotated.width = side;
+  rotated.height = side;
+  const rctx = rotated.getContext("2d")!;
+  rctx.translate(side / 2, side / 2);
+  rctx.rotate((rotationDeg * Math.PI) / 180);
+  rctx.drawImage(sheet, -side / 2, -side / 2);
+
+  const out = document.createElement("canvas");
+  out.width = logicalW;
+  out.height = logicalH;
+  const octx = out.getContext("2d")!;
+  octx.drawImage(
+    rotated,
+    (side - logicalW) / 2,
+    (side - logicalH) / 2,
+    logicalW,
+    logicalH,
+    0,
+    0,
+    logicalW,
+    logicalH
+  );
+  return out;
+}
+
+/** Draw the print once at its stored position/size — already "one whole
+ * picture," so no oversizing trick needed (only tiling has the seam issue). */
+function renderSingleLayer(
+  print: HTMLImageElement,
+  layer: CadLayer,
+  logicalW: number,
+  logicalH: number
+): HTMLCanvasElement {
+  const out = document.createElement("canvas");
+  out.width = logicalW;
+  out.height = logicalH;
+  const ctx = out.getContext("2d")!;
+  ctx.save();
+  ctx.translate(layer.single.x, layer.single.y);
+  if (layer.mirrored) ctx.scale(-1, 1);
+  ctx.rotate((layer.rotation * Math.PI) / 180);
+  ctx.filter = `hue-rotate(${layer.hue}deg)`;
+  ctx.drawImage(
+    print,
+    -layer.single.width / 2,
+    -layer.single.height / 2,
+    layer.single.width,
+    layer.single.height
+  );
+  ctx.restore();
+  return out;
+}
+
+function compositeLayer(
+  ctx: CanvasRenderingContext2D,
+  layerCanvas: HTMLCanvasElement,
+  maskCanvas: HTMLCanvasElement,
+  logicalW: number,
+  logicalH: number
+) {
+  const clipped = document.createElement("canvas");
+  clipped.width = logicalW;
+  clipped.height = logicalH;
+  const cctx = clipped.getContext("2d")!;
+  cctx.drawImage(layerCanvas, 0, 0);
+  cctx.globalCompositeOperation = "destination-in";
+  cctx.drawImage(maskCanvas, 0, 0);
+
+  ctx.save();
+  ctx.globalCompositeOperation = "multiply";
+  ctx.drawImage(clipped, 0, 0, logicalW, logicalH);
+  ctx.restore();
 }
 
 /**
@@ -108,17 +223,12 @@ function getHiDpiContext(
   return ctx;
 }
 
-/**
- * Draw sketch + print clipped to garment mask (destination-in).
- * `logicalWidth`/`logicalHeight` are the drawing-space dimensions; canvas
- * backing store should already be sized with configureHiDpiCanvas.
- */
-function renderCadToCanvas(
+async function renderLayersToCanvas(
   canvas: HTMLCanvasElement,
   sketch: HTMLImageElement,
-  print: HTMLImageElement,
-  controls: CadControls,
-  maskCanvas: HTMLCanvasElement | null,
+  layers: CadLayer[],
+  layerMasks: Map<string, HTMLCanvasElement>,
+  printImages: Map<string, HTMLImageElement>,
   logicalWidth: number,
   logicalHeight: number,
   dpr: number
@@ -131,35 +241,25 @@ function renderCadToCanvas(
   ctx.fillRect(0, 0, logicalWidth, logicalHeight);
   ctx.drawImage(sketch, layout.sx, layout.sy, layout.sw, layout.sh);
 
-  if (
-    !maskCanvas ||
-    maskCanvas.width !== logicalWidth ||
-    maskCanvas.height !== logicalHeight
-  ) {
-    return;
+  for (const layer of layers) {
+    if (!layer.printId) continue;
+    const mask = layerMasks.get(layer.id);
+    if (!mask) continue;
+    const print = printImages.get(layer.printId);
+    if (!print) continue;
+
+    const layerCanvas =
+      layer.placement === "tile"
+        ? buildRotatedTileLayer(
+            buildPrintTile(print, layer),
+            layer.rotation,
+            logicalWidth,
+            logicalHeight
+          )
+        : renderSingleLayer(print, layer, logicalWidth, logicalHeight);
+
+    compositeLayer(ctx, layerCanvas, mask, logicalWidth, logicalHeight);
   }
-
-  // 1) Print pattern layer (logical pixels)
-  const printLayer = document.createElement("canvas");
-  printLayer.width = logicalWidth;
-  printLayer.height = logicalHeight;
-  const pctx = printLayer.getContext("2d")!;
-  const tile = buildPrintTile(print, controls);
-  const pattern = pctx.createPattern(tile, "repeat");
-  if (pattern) {
-    pctx.fillStyle = pattern;
-    pctx.fillRect(0, 0, logicalWidth, logicalHeight);
-  }
-
-  // 2) Clip print to mask via destination-in
-  pctx.globalCompositeOperation = "destination-in";
-  pctx.drawImage(maskCanvas, 0, 0);
-
-  // 3) Composite clipped print over base sketch
-  ctx.save();
-  ctx.globalCompositeOperation = "multiply";
-  ctx.drawImage(printLayer, 0, 0, logicalWidth, logicalHeight);
-  ctx.restore();
 
   // Keep line art crisp on top
   ctx.save();
@@ -176,6 +276,26 @@ function triggerDownload(dataUrl: string, filename: string) {
   a.click();
 }
 
+function layerHasFill(mask: HTMLCanvasElement | undefined): boolean {
+  if (!mask) return false;
+  const ctx = mask.getContext("2d")!;
+  return maskHasContent(ctx.getImageData(0, 0, mask.width, mask.height));
+}
+
+function createLayer(logicalW: number, logicalH: number): CadLayer {
+  const size = Math.round(Math.min(logicalW, logicalH) * 0.25);
+  return {
+    id: crypto.randomUUID(),
+    printId: null,
+    placement: "tile",
+    scale: 1,
+    rotation: 0,
+    hue: 0,
+    mirrored: false,
+    single: { x: logicalW / 2, y: logicalH / 2, width: size, height: size },
+  };
+}
+
 export default function CadPage({
   params,
 }: {
@@ -185,53 +305,49 @@ export default function CadPage({
   const router = useRouter();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const sketchBufferRef = useRef<HTMLCanvasElement | null>(null);
-  const maskCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const sketchRef = useRef<HTMLImageElement | null>(null);
-  const printCache = useRef<Map<string, HTMLImageElement>>(new Map());
+  const layerMasksRef = useRef<Map<string, HTMLCanvasElement>>(new Map());
+  const printImagesRef = useRef<Map<string, HTMLImageElement>>(new Map());
+  const uploadInputRef = useRef<HTMLInputElement>(null);
   const logicalSizeRef = useRef({ w: 0, h: 0 });
   const dprRef = useRef(1);
 
   const [asset, setAsset] = useState<Asset | null>(null);
   const [chain, setChain] = useState<Asset[]>([]);
+  const [prints, setPrints] = useState<Print[]>([]);
+  const [layers, setLayers] = useState<CadLayer[]>([]);
+  const [activeLayerId, setActiveLayerId] = useState<string | null>(null);
+  const [renderTick, setRenderTick] = useState(0);
   const [loading, setLoading] = useState(true);
-  const [controls, setControls] = useState<CadControls>(DEFAULT_CAD_CONTROLS);
-  const [showVariants, setShowVariants] = useState(false);
-  const [variants, setVariants] = useState<VariantThumb[]>([]);
   const [approving, setApproving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [fillCount, setFillCount] = useState(0);
   const [hint, setHint] = useState(
-    "Click inside the garment outline to fill a region with the print."
+    "Add a layer, then click inside the garment outline to fill a region for it."
   );
 
-  const getPrint = useCallback(async (printId: PrintId) => {
-    const meta = PRINTS.find((p) => p.id === printId)!;
-    const cached = printCache.current.get(meta.src);
-    if (cached) return cached;
-    const img = await loadImage(meta.src);
-    printCache.current.set(meta.src, img);
-    return img;
-  }, []);
+  const activeLayer = layers.find((l) => l.id === activeLayerId) ?? null;
 
-  const ensureBuffers = useCallback((w: number, h: number) => {
+  const getPrintImage = useCallback(
+    async (printId: string): Promise<HTMLImageElement | null> => {
+      const meta = prints.find((p) => p.id === printId);
+      if (!meta) return null;
+      const cached = printImagesRef.current.get(meta.src);
+      if (cached) return cached;
+      const img = await loadImage(meta.src);
+      printImagesRef.current.set(meta.src, img);
+      return img;
+    },
+    [prints]
+  );
+
+  const ensureSketchBuffer = useCallback((w: number, h: number) => {
     if (!sketchBufferRef.current) {
       sketchBufferRef.current = document.createElement("canvas");
     }
-    if (!maskCanvasRef.current) {
-      maskCanvasRef.current = document.createElement("canvas");
-    }
-    const sketchBuf = sketchBufferRef.current;
-    const mask = maskCanvasRef.current;
-    if (sketchBuf.width !== w || sketchBuf.height !== h) {
-      sketchBuf.width = w;
-      sketchBuf.height = h;
-    }
-    if (mask.width !== w || mask.height !== h) {
-      mask.width = w;
-      mask.height = h;
-      const mctx = mask.getContext("2d")!;
-      mctx.clearRect(0, 0, w, h);
-      setFillCount(0);
+    const buf = sketchBufferRef.current;
+    if (buf.width !== w || buf.height !== h) {
+      buf.width = w;
+      buf.height = h;
     }
   }, []);
 
@@ -252,13 +368,23 @@ export default function CadPage({
     const { w: logicalW, h: logicalH } = logicalSizeRef.current;
     if (!canvas || !sketch || !logicalW || !logicalH) return;
     try {
-      const print = await getPrint(controls.printId);
-      renderCadToCanvas(
+      const entries = await Promise.all(
+        layers
+          .filter((l) => l.printId)
+          .map(
+            async (l) =>
+              [l.printId as string, await getPrintImage(l.printId as string)] as const
+          )
+      );
+      const printImages = new Map(
+        entries.filter((e): e is [string, HTMLImageElement] => !!e[1])
+      );
+      await renderLayersToCanvas(
         canvas,
         sketch,
-        print,
-        controls,
-        maskCanvasRef.current,
+        layers,
+        layerMasksRef.current,
+        printImages,
         logicalW,
         logicalH,
         dprRef.current
@@ -266,27 +392,26 @@ export default function CadPage({
     } catch (err) {
       setError(err instanceof Error ? err.message : "Render failed");
     }
-  }, [controls, getPrint]);
+  }, [layers, getPrintImage]);
 
-  // Fetch asset + chain data. Deliberately does NOT touch canvasRef here —
-  // the <canvas> element doesn't exist in the DOM yet while `loading` is
-  // still true (this component early-returns a "Loading…" placeholder), so
-  // reading canvasRef.current in this effect would always see null.
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const [oneRes, allRes] = await Promise.all([
+        const [oneRes, allRes, printsRes] = await Promise.all([
           fetch(`/api/assets?id=${id}`),
           fetch("/api/assets"),
+          fetch("/api/prints"),
         ]);
         const oneData = await oneRes.json();
         const allData = await allRes.json();
+        const printsData = await printsRes.json();
         if (cancelled) return;
 
         const a: Asset | null = oneData.asset ?? null;
         setAsset(a);
         setChain(getFullChain(allData.assets ?? [], id));
+        setPrints(printsData.prints ?? []);
       } catch {
         if (!cancelled) setAsset(null);
       } finally {
@@ -298,9 +423,6 @@ export default function CadPage({
     };
   }, [id]);
 
-  // Runs once `asset` is set and the canvas has actually mounted (loading
-  // is false by then, in the same batched update as `asset`) — loads the
-  // sketch image, sizes the canvas at native resolution, and paints it.
   useEffect(() => {
     if (!asset?.imageUrl) return;
     let cancelled = false;
@@ -316,7 +438,7 @@ export default function CadPage({
           const { dpr } = configureHiDpiCanvas(canvas, logicalW, logicalH);
           dprRef.current = dpr;
           logicalSizeRef.current = { w: logicalW, h: logicalH };
-          ensureBuffers(logicalW, logicalH);
+          ensureSketchBuffer(logicalW, logicalH);
           paintSketchBuffer();
           await redraw();
         }
@@ -329,28 +451,56 @@ export default function CadPage({
     return () => {
       cancelled = true;
     };
-  }, [asset, ensureBuffers, paintSketchBuffer, redraw]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [asset, ensureSketchBuffer, paintSketchBuffer]);
 
   useEffect(() => {
     if (!loading && sketchRef.current) {
       redraw();
     }
-  }, [loading, redraw, fillCount]);
+  }, [loading, redraw, renderTick]);
 
-  function patchControls(patch: Partial<CadControls>) {
-    setControls((c) => ({ ...c, ...patch }));
+  function patchLayer(layerId: string, patch: Partial<CadLayer>) {
+    setLayers((ls) => ls.map((l) => (l.id === layerId ? { ...l, ...patch } : l)));
+  }
+
+  function patchActiveLayer(patch: Partial<CadLayer>) {
+    if (!activeLayerId) return;
+    patchLayer(activeLayerId, patch);
+  }
+
+  function handleAddLayer() {
+    const { w, h } = logicalSizeRef.current;
+    if (!w || !h) return;
+    const layer = createLayer(w, h);
+    const mask = document.createElement("canvas");
+    mask.width = w;
+    mask.height = h;
+    layerMasksRef.current.set(layer.id, mask);
+    setLayers((ls) => [...ls, layer]);
+    setActiveLayerId(layer.id);
+    setHint("Click inside an enclosed region to fill it for this layer.");
+  }
+
+  function handleRemoveLayer(layerId: string) {
+    layerMasksRef.current.delete(layerId);
+    setLayers((ls) => ls.filter((l) => l.id !== layerId));
+    setActiveLayerId((cur) => (cur === layerId ? null : cur));
+    setRenderTick((n) => n + 1);
   }
 
   function handleCanvasClick(e: React.MouseEvent<HTMLCanvasElement>) {
+    if (!activeLayerId) {
+      setHint("Add or select a layer first, then click inside the garment outline.");
+      return;
+    }
     const canvas = canvasRef.current;
     const sketchBuf = sketchBufferRef.current;
-    const mask = maskCanvasRef.current;
+    const mask = layerMasksRef.current.get(activeLayerId);
     const { w: logicalW, h: logicalH } = logicalSizeRef.current;
     if (!canvas || !sketchBuf || !mask || !logicalW || !logicalH) return;
 
     const rect = canvas.getBoundingClientRect();
-    // Map click in rendered (CSS) pixels to logical drawing pixels — works
-    // regardless of how large/small the canvas is actually displayed.
     const x = Math.floor(((e.clientX - rect.left) / rect.width) * logicalW);
     const y = Math.floor(((e.clientY - rect.top) / rect.height) * logicalH);
 
@@ -362,82 +512,112 @@ export default function CadPage({
     const added = floodFillToMask(source, maskData, x, y);
     if (added === 0) {
       setHint(
-        "No fill — click a white area inside a closed garment outline (not on a black line, and not a region already filled)."
+        "No fill — click a white area inside a closed garment outline (not on a black line, and not a region already filled by this layer)."
       );
       return;
     }
 
     mctx.putImageData(maskData, 0, 0);
-    setFillCount((n) => n + 1);
+    setRenderTick((n) => n + 1);
     setHint(
-      "Region added. Click another enclosed area (e.g. a sleeve) to add more, or adjust the print controls."
+      "Region added to this layer. Click another enclosed area, or adjust its print/placement."
     );
     setError(null);
   }
 
-  function resetToDefaults() {
-    const mask = maskCanvasRef.current;
-    if (mask) {
-      const mctx = mask.getContext("2d")!;
-      const data = mctx.getImageData(0, 0, mask.width, mask.height);
-      clearMask(data);
-      mctx.putImageData(data, 0, 0);
-    }
-    setFillCount(0);
-    setVariants([]);
-    setShowVariants(false);
-    setControls(DEFAULT_CAD_CONTROLS);
-    setHint("Mask cleared. Click inside the garment to fill again.");
+  function resetAllLayers() {
+    layerMasksRef.current.clear();
+    setLayers([]);
+    setActiveLayerId(null);
+    setRenderTick((n) => n + 1);
+    setHint("Layers cleared. Add a layer and click inside the garment to fill again.");
   }
 
-  async function handleGenerateVariants() {
-    const sketch = sketchRef.current;
-    const mask = maskCanvasRef.current;
+  async function handleUploadPrint(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const dataUrl = await readFileAsDataUrl(file);
+      const res = await fetch("/api/prints", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          label: file.name.replace(/\.[^.]+$/, ""),
+          dataUrl,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Upload failed");
+      setPrints((ps) => [...ps, data.print]);
+      patchActiveLayer({ printId: data.print.id });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Print upload failed");
+    } finally {
+      if (uploadInputRef.current) uploadInputRef.current.value = "";
+    }
+  }
+
+  function handleDragStart(e: React.PointerEvent) {
+    if (!activeLayer) return;
+    e.preventDefault();
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
     const { w: logicalW, h: logicalH } = logicalSizeRef.current;
-    if (!sketch || !mask || !logicalW || !logicalH) return;
+    const startClientX = e.clientX;
+    const startClientY = e.clientY;
+    const startSingle = { ...activeLayer.single };
+    const layerId = activeLayer.id;
 
-    const mctx = mask.getContext("2d")!;
-    if (!maskHasContent(mctx.getImageData(0, 0, mask.width, mask.height))) {
-      setError(
-        "Fill at least one garment region by clicking inside the outline first."
-      );
-      return;
+    function onMove(ev: PointerEvent) {
+      const dxLogical = ((ev.clientX - startClientX) / rect.width) * logicalW;
+      const dyLogical = ((ev.clientY - startClientY) / rect.height) * logicalH;
+      patchLayer(layerId, {
+        single: {
+          ...startSingle,
+          x: startSingle.x + dxLogical,
+          y: startSingle.y + dyLogical,
+        },
+      });
     }
-
-    setError(null);
-    const print = await getPrint(controls.printId);
-    const thumbs: VariantThumb[] = [];
-    const off = document.createElement("canvas");
-    const dpr = dprRef.current;
-    configureHiDpiCanvas(off, logicalW, logicalH, dpr);
-
-    for (const scale of BATCH_SCALES) {
-      for (const hue of BATCH_HUES) {
-        const variant: CadControls = { ...controls, scale, hue };
-        renderCadToCanvas(
-          off,
-          sketch,
-          print,
-          variant,
-          mask,
-          logicalW,
-          logicalH,
-          dpr
-        );
-        thumbs.push({
-          id: `${controls.printId}-${scale}-${hue}`,
-          dataUrl: off.toDataURL("image/png"),
-          scale,
-          hue,
-        });
-      }
+    function onUp() {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
     }
-    setVariants(thumbs);
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
   }
 
-  function applyVariant(thumb: VariantThumb) {
-    patchControls({ scale: thumb.scale, hue: thumb.hue });
-    setShowVariants(false);
+  function handleResizeStart(e: React.PointerEvent) {
+    if (!activeLayer) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const { w: logicalW, h: logicalH } = logicalSizeRef.current;
+    const startClientX = e.clientX;
+    const startClientY = e.clientY;
+    const startSingle = { ...activeLayer.single };
+    const layerId = activeLayer.id;
+
+    function onMove(ev: PointerEvent) {
+      const dxLogical = ((ev.clientX - startClientX) / rect.width) * logicalW;
+      const dyLogical = ((ev.clientY - startClientY) / rect.height) * logicalH;
+      patchLayer(layerId, {
+        single: {
+          ...startSingle,
+          width: Math.max(MIN_SINGLE_SIZE, startSingle.width + dxLogical * 2),
+          height: Math.max(MIN_SINGLE_SIZE, startSingle.height + dyLogical * 2),
+        },
+      });
+    }
+    function onUp() {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    }
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
   }
 
   function handleDownload() {
@@ -462,11 +642,15 @@ export default function CadPage({
           imageUrl: dataUrl,
           status: "approved",
           meta: {
-            printId: controls.printId,
-            scale: controls.scale,
-            rotation: controls.rotation,
-            mirrored: controls.mirrored,
-            colorway: controls.hue,
+            layers: layers.map((l) => ({
+              printId: l.printId,
+              placement: l.placement,
+              scale: l.scale,
+              rotation: l.rotation,
+              hue: l.hue,
+              mirrored: l.mirrored,
+              single: l.single,
+            })),
             sourceSketchId: id,
           },
         }),
@@ -488,6 +672,11 @@ export default function CadPage({
     return <p className="text-sm text-accent-orange">Asset not found.</p>;
   }
 
+  const canApprove = layers.some(
+    (l) => l.printId && layerHasFill(layerMasksRef.current.get(l.id))
+  );
+  const { w: logicalW, h: logicalH } = logicalSizeRef.current;
+
   return (
     <div className="mx-auto max-w-5xl space-y-8">
       <StageStepper current="cad" chain={chain} />
@@ -501,26 +690,54 @@ export default function CadPage({
         </Link>
         <h1 className="text-2xl font-semibold tracking-tight">CAD Fill</h1>
         <p className="text-sm text-cream-muted">
-          Click inside closed garment regions to build a silhouette mask, then
-          apply a print fill.
+          Add a layer, fill a region for it, then give that layer its own
+          print and placement — tile it across the region, or place it once
+          and drag/resize it by hand.
         </p>
       </div>
 
       <div className="grid gap-8 lg:grid-cols-[1fr_280px]">
         <div className="space-y-3">
           <div className="mx-auto max-w-[640px] overflow-hidden rounded-lg border border-navy-50 bg-white">
-            <canvas
-              ref={canvasRef}
-              onClick={handleCanvasClick}
-              className="block h-auto w-full cursor-crosshair"
-            />
+            <div className="relative">
+              <canvas
+                ref={canvasRef}
+                onClick={handleCanvasClick}
+                className="block h-auto w-full cursor-crosshair"
+              />
+              {activeLayer && activeLayer.placement === "single" && logicalW > 0 && (
+                <div
+                  className="absolute cursor-move border-2 border-dashed border-accent-orange bg-accent-orange/10"
+                  style={{
+                    left: `${
+                      ((activeLayer.single.x - activeLayer.single.width / 2) /
+                        logicalW) *
+                      100
+                    }%`,
+                    top: `${
+                      ((activeLayer.single.y - activeLayer.single.height / 2) /
+                        logicalH) *
+                      100
+                    }%`,
+                    width: `${(activeLayer.single.width / logicalW) * 100}%`,
+                    height: `${(activeLayer.single.height / logicalH) * 100}%`,
+                  }}
+                  onPointerDown={handleDragStart}
+                >
+                  <div
+                    className="absolute -bottom-1.5 -right-1.5 h-3 w-3 cursor-nwse-resize rounded-full border border-navy bg-accent-orange"
+                    onPointerDown={handleResizeStart}
+                  />
+                </div>
+              )}
+            </div>
           </div>
           <div className="flex items-center justify-between gap-3">
             <p className="text-xs text-cream-muted">{hint}</p>
             <button
               type="button"
               onClick={handleDownload}
-              disabled={fillCount === 0}
+              disabled={!canApprove}
               className="shrink-0 text-xs font-medium text-accent-blue transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
             >
               Download
@@ -536,124 +753,227 @@ export default function CadPage({
         <aside className="space-y-6">
           <section className="space-y-3">
             <h2 className="text-xs font-medium uppercase tracking-wider text-cream-muted">
-              Silhouette mask
+              Layers
             </h2>
-            <p className="text-xs text-cream-muted">
-              Regions filled: <span className="text-cream">{fillCount}</span>
-            </p>
+            {layers.length === 0 ? (
+              <p className="text-xs text-cream-muted">No layers yet.</p>
+            ) : (
+              <ul className="space-y-1.5">
+                {layers.map((l, idx) => {
+                  const print = prints.find((p) => p.id === l.printId);
+                  const filled = layerHasFill(layerMasksRef.current.get(l.id));
+                  return (
+                    <li
+                      key={l.id}
+                      onClick={() => setActiveLayerId(l.id)}
+                      className={[
+                        "flex cursor-pointer items-center gap-2 rounded-md border px-2 py-1.5 text-xs transition",
+                        l.id === activeLayerId
+                          ? "border-accent-blue bg-accent-blue/10"
+                          : "border-navy-50 hover:border-cream-muted",
+                      ].join(" ")}
+                    >
+                      <span className="h-6 w-6 shrink-0 overflow-hidden rounded border border-navy-50 bg-navy">
+                        {print && (
+                          // eslint-disable-next-line @next/next/no-img-element
+                          <img
+                            src={print.src}
+                            alt=""
+                            className="h-full w-full object-cover"
+                          />
+                        )}
+                      </span>
+                      <span className="flex-1 truncate text-cream-muted">
+                        Layer {idx + 1}
+                        {!filled && " (empty)"}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleRemoveLayer(l.id);
+                        }}
+                        aria-label={`Remove layer ${idx + 1}`}
+                        className="shrink-0 text-cream-muted transition hover:text-accent-orange"
+                      >
+                        ×
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+            <button
+              type="button"
+              onClick={handleAddLayer}
+              className="w-full rounded-md border border-navy-50 px-3 py-2 text-sm text-cream-muted transition hover:border-cream-muted hover:text-cream"
+            >
+              + Add layer
+            </button>
           </section>
 
-          <section className="space-y-3">
-            <h2 className="text-xs font-medium uppercase tracking-wider text-cream-muted">
-              Print
-            </h2>
-            <div className="grid grid-cols-2 gap-2">
-              {PRINTS.map((p) => (
-                <button
-                  key={p.id}
-                  type="button"
-                  onClick={() => patchControls({ printId: p.id })}
-                  className={[
-                    "overflow-hidden rounded-md border p-1 transition",
-                    controls.printId === p.id
-                      ? "border-accent-blue ring-1 ring-accent-blue"
-                      : "border-navy-50 hover:border-cream-muted",
-                  ].join(" ")}
-                >
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img
-                    src={p.src}
-                    alt={p.label}
-                    className="aspect-square w-full object-cover"
+          {activeLayer ? (
+            <>
+              <section className="space-y-3">
+                <h2 className="text-xs font-medium uppercase tracking-wider text-cream-muted">
+                  Print
+                </h2>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => uploadInputRef.current?.click()}
+                    className="flex aspect-square flex-col items-center justify-center gap-1 rounded-md border border-dashed border-navy-50 text-cream-muted transition hover:border-accent-blue hover:text-cream"
+                  >
+                    <span className="text-lg leading-none">+</span>
+                    <span className="text-[10px]">Upload</span>
+                  </button>
+                  {prints.map((p) => (
+                    <button
+                      key={p.id}
+                      type="button"
+                      onClick={() => patchActiveLayer({ printId: p.id })}
+                      className={[
+                        "overflow-hidden rounded-md border p-1 transition",
+                        activeLayer.printId === p.id
+                          ? "border-accent-blue ring-1 ring-accent-blue"
+                          : "border-navy-50 hover:border-cream-muted",
+                      ].join(" ")}
+                    >
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img
+                        src={p.src}
+                        alt={p.label}
+                        className="aspect-square w-full object-cover"
+                      />
+                      <span className="mt-1 block truncate text-center text-[10px] text-cream-muted">
+                        {p.label}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+                <input
+                  ref={uploadInputRef}
+                  type="file"
+                  accept="image/*"
+                  className="hidden"
+                  onChange={handleUploadPrint}
+                />
+              </section>
+
+              <section className="space-y-2">
+                <h2 className="text-xs font-medium uppercase tracking-wider text-cream-muted">
+                  Placement
+                </h2>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => patchActiveLayer({ placement: "tile" })}
+                    className={[
+                      "flex-1 rounded-md border px-3 py-1.5 text-xs font-medium transition",
+                      activeLayer.placement === "tile"
+                        ? "border-accent-blue bg-accent-blue/10 text-cream"
+                        : "border-navy-50 text-cream-muted hover:border-cream-muted",
+                    ].join(" ")}
+                  >
+                    Tile
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => patchActiveLayer({ placement: "single" })}
+                    className={[
+                      "flex-1 rounded-md border px-3 py-1.5 text-xs font-medium transition",
+                      activeLayer.placement === "single"
+                        ? "border-accent-blue bg-accent-blue/10 text-cream"
+                        : "border-navy-50 text-cream-muted hover:border-cream-muted",
+                    ].join(" ")}
+                  >
+                    Single, centered
+                  </button>
+                </div>
+                {activeLayer.placement === "single" && (
+                  <p className="text-[11px] text-cream-muted">
+                    Drag the box on the canvas to reposition; drag its corner
+                    handle to resize.
+                  </p>
+                )}
+              </section>
+
+              <section className="space-y-4">
+                <h2 className="text-xs font-medium uppercase tracking-wider text-cream-muted">
+                  Controls
+                </h2>
+
+                {activeLayer.placement === "tile" && (
+                  <label className="block space-y-1">
+                    <div className="flex justify-between text-xs text-cream-muted">
+                      <span>Scale</span>
+                      <span>{Math.round(activeLayer.scale * 100)}%</span>
+                    </div>
+                    <input
+                      type="range"
+                      min={50}
+                      max={200}
+                      value={Math.round(activeLayer.scale * 100)}
+                      onChange={(e) =>
+                        patchActiveLayer({ scale: Number(e.target.value) / 100 })
+                      }
+                      className="w-full accent-accent-blue"
+                    />
+                  </label>
+                )}
+
+                <label className="block space-y-1">
+                  <div className="flex justify-between text-xs text-cream-muted">
+                    <span>Rotation</span>
+                    <span>{activeLayer.rotation}°</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0}
+                    max={360}
+                    value={activeLayer.rotation}
+                    onChange={(e) =>
+                      patchActiveLayer({ rotation: Number(e.target.value) })
+                    }
+                    className="w-full accent-accent-blue"
                   />
-                  <span className="mt-1 block text-center text-[10px] text-cream-muted">
-                    {p.label}
-                  </span>
-                </button>
-              ))}
-            </div>
-          </section>
+                </label>
 
-          <section className="space-y-4">
-            <h2 className="text-xs font-medium uppercase tracking-wider text-cream-muted">
-              Controls
-            </h2>
+                <label className="block space-y-1">
+                  <div className="flex justify-between text-xs text-cream-muted">
+                    <span>Recolor (hue)</span>
+                    <span>{activeLayer.hue}°</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0}
+                    max={360}
+                    value={activeLayer.hue}
+                    onChange={(e) =>
+                      patchActiveLayer({ hue: Number(e.target.value) })
+                    }
+                    className="w-full accent-accent-orange"
+                  />
+                </label>
 
-            <label className="block space-y-1">
-              <div className="flex justify-between text-xs text-cream-muted">
-                <span>Scale</span>
-                <span>{Math.round(controls.scale * 100)}%</span>
-              </div>
-              <input
-                type="range"
-                min={50}
-                max={200}
-                value={Math.round(controls.scale * 100)}
-                onChange={(e) =>
-                  patchControls({ scale: Number(e.target.value) / 100 })
-                }
-                className="w-full accent-accent-blue"
-              />
-            </label>
-
-            <label className="block space-y-1">
-              <div className="flex justify-between text-xs text-cream-muted">
-                <span>Rotation</span>
-                <span>{controls.rotation}°</span>
-              </div>
-              <input
-                type="range"
-                min={0}
-                max={360}
-                value={controls.rotation}
-                onChange={(e) =>
-                  patchControls({ rotation: Number(e.target.value) })
-                }
-                className="w-full accent-accent-blue"
-              />
-            </label>
-
-            <label className="block space-y-1">
-              <div className="flex justify-between text-xs text-cream-muted">
-                <span>Recolor (hue)</span>
-                <span>{controls.hue}°</span>
-              </div>
-              <input
-                type="range"
-                min={0}
-                max={360}
-                value={controls.hue}
-                onChange={(e) =>
-                  patchControls({ hue: Number(e.target.value) })
-                }
-                className="w-full accent-accent-orange"
-              />
-            </label>
-
-            <label className="flex items-center gap-2 text-sm">
-              <input
-                type="checkbox"
-                checked={controls.mirrored}
-                onChange={(e) =>
-                  patchControls({ mirrored: e.target.checked })
-                }
-                className="accent-accent-blue"
-              />
-              Mirror print
-            </label>
-          </section>
-
-          <button
-            type="button"
-            onClick={() => {
-              if (!showVariants) handleGenerateVariants();
-              setShowVariants((v) => !v);
-            }}
-            disabled={!asset.imageUrl || fillCount === 0}
-            className="w-full rounded-md border border-navy-50 px-3 py-2 text-sm text-cream-muted transition hover:border-cream-muted hover:text-cream disabled:cursor-not-allowed disabled:opacity-40"
-          >
-            {showVariants ? "Hide print variants" : "Explore print variants (optional)"}
-          </button>
+                <label className="flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={activeLayer.mirrored}
+                    onChange={(e) =>
+                      patchActiveLayer({ mirrored: e.target.checked })
+                    }
+                    className="accent-accent-blue"
+                  />
+                  Mirror print
+                </label>
+              </section>
+            </>
+          ) : (
+            <p className="text-xs text-cream-muted">
+              Add a layer to choose a print and start filling regions.
+            </p>
+          )}
         </aside>
       </div>
 
@@ -663,38 +983,10 @@ export default function CadPage({
         </p>
       )}
 
-      {showVariants && variants.length > 0 && (
-        <section className="space-y-4 border-t border-navy-50 pt-6">
-          <h2 className="text-sm font-medium uppercase tracking-wider text-cream-muted">
-            Print variants — click one to load it onto the canvas
-          </h2>
-          <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
-            {variants.map((thumb) => (
-              <button
-                key={thumb.id}
-                type="button"
-                onClick={() => applyVariant(thumb)}
-                className="overflow-hidden rounded-lg border border-navy-50 bg-white text-left transition hover:border-accent-blue"
-              >
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img
-                  src={thumb.dataUrl}
-                  alt={`Variant scale ${thumb.scale} hue ${thumb.hue}`}
-                  className="aspect-square w-full object-contain"
-                />
-                <div className="px-2 py-1.5 text-[10px] text-cream-muted">
-                  {Math.round(thumb.scale * 100)}% · hue {thumb.hue}°
-                </div>
-              </button>
-            ))}
-          </div>
-        </section>
-      )}
-
       <ApprovalBar
-        disabled={fillCount === 0 || approving}
+        disabled={!canApprove || approving}
         onApprove={handleApproveLive}
-        onDiscard={resetToDefaults}
+        onDiscard={resetAllLayers}
         approveLabel={approving ? "Approving…" : "Approve → Minibody"}
       />
     </div>

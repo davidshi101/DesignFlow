@@ -1,0 +1,26 @@
+[
+  {
+    "id": "floral",
+    "label": "Floral",
+    "src": "/prints/floral.png",
+    "createdAt": "2026-07-28T16:38:26.967Z"
+  },
+  {
+    "id": "stripe",
+    "label": "Stripe",
+    "src": "/prints/stripe.png",
+    "createdAt": "2026-07-28T16:38:26.967Z"
+  },
+  {
+    "id": "check",
+    "label": "Check",
+    "src": "/prints/check.png",
+    "createdAt": "2026-07-28T16:38:26.967Z"
+  },
+  {
+    "id": "dots",
+    "label": "Dots",
+    "src": "/prints/dots.png",
+    "createdAt": "2026-07-28T16:38:26.967Z"
+  }
+]
