@@ -5,12 +5,21 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import StageStepper from "@/components/StageStepper";
 import ApprovalBar from "@/components/ApprovalBar";
+import Toggle from "@/components/Toggle";
+import AssetThumbPicker from "@/components/AssetThumbPicker";
 import type { Asset } from "@/lib/store";
 import type { Print } from "@/lib/printStore";
-import { getFullChain } from "@/lib/chain";
-import { floodFillToMask, maskHasContent } from "@/lib/floodFill";
+import { getAncestorChain, getFullChain, startFromHref } from "@/lib/chain";
+import {
+  floodClearMask,
+  floodFillToMask,
+  isWhitePixel,
+  maskHasContent,
+} from "@/lib/floodFill";
+import { triggerDownload } from "@/lib/download";
 
 type Placement = "tile" | "single";
+type MaskMode = "fill" | "brush" | "erase";
 
 interface SingleRect {
   x: number; // logical px, center
@@ -40,6 +49,7 @@ interface SketchLayout {
 // Defensive upper bound only — Gemini caps real output around 1024x1024.
 const MAX_LOGICAL_DIM = 2048;
 const MIN_SINGLE_SIZE = 16;
+const DEFAULT_BRUSH_SIZE = 40;
 
 function loadImage(src: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
@@ -60,6 +70,23 @@ function readFileAsDataUrl(file: File): Promise<string> {
   });
 }
 
+/** Maps a pointer event's client coordinates to logical (drawing-space)
+ * canvas coordinates — same ratio math used everywhere else in this file
+ * (click-to-fill, single-placement drag/resize). */
+function clientToLogical(
+  canvas: HTMLCanvasElement,
+  logicalW: number,
+  logicalH: number,
+  clientX: number,
+  clientY: number
+): { x: number; y: number } {
+  const rect = canvas.getBoundingClientRect();
+  return {
+    x: ((clientX - rect.left) / rect.width) * logicalW,
+    y: ((clientY - rect.top) / rect.height) * logicalH,
+  };
+}
+
 function fitSketch(
   canvasW: number,
   canvasH: number,
@@ -76,6 +103,92 @@ function fitSketch(
   };
 }
 
+/** r,g,b in 0–255 → h,s,l with h in [0,1), s/l in [0,1]. */
+function rgbToHsl(
+  r: number,
+  g: number,
+  b: number
+): { h: number; s: number; l: number } {
+  r /= 255;
+  g /= 255;
+  b /= 255;
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const l = (max + min) / 2;
+  if (max === min) return { h: 0, s: 0, l };
+  const d = max - min;
+  const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+  let h = 0;
+  switch (max) {
+    case r:
+      h = ((g - b) / d + (g < b ? 6 : 0)) / 6;
+      break;
+    case g:
+      h = ((b - r) / d + 2) / 6;
+      break;
+    default:
+      h = ((r - g) / d + 4) / 6;
+      break;
+  }
+  return { h, s, l };
+}
+
+/** h in [0,1), s/l in [0,1] → r,g,b in 0–255. */
+function hslToRgb(h: number, s: number, l: number): [number, number, number] {
+  if (s === 0) {
+    const v = Math.round(l * 255);
+    return [v, v, v];
+  }
+  const hue2rgb = (p: number, q: number, t: number) => {
+    if (t < 0) t += 1;
+    if (t > 1) t -= 1;
+    if (t < 1 / 6) return p + (q - p) * 6 * t;
+    if (t < 1 / 2) return q;
+    if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+    return p;
+  };
+  const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+  const p = 2 * l - q;
+  return [
+    Math.round(hue2rgb(p, q, h + 1 / 3) * 255),
+    Math.round(hue2rgb(p, q, h) * 255),
+    Math.round(hue2rgb(p, q, h - 1 / 3) * 255),
+  ];
+}
+
+/**
+ * Recolor in place. CSS `hue-rotate` is a no-op on grayscale (Black / White /
+ * Word mark have no chroma to rotate), so we remap pixels instead:
+ * chromatic → same sat/lightness at the new hue; mid-gray → saturated tint;
+ * near-black → a visible saturated color (so solid Black fills actually change);
+ * near-white left alone (stays "no ink" under multiply compositing).
+ * hue === 0 means leave the print unchanged.
+ */
+function applyRecolor(canvas: HTMLCanvasElement, hue: number): void {
+  if (!hue) return;
+  const ctx = canvas.getContext("2d")!;
+  const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const d = img.data;
+  const targetH = ((hue % 360) + 360) % 360 / 360;
+
+  for (let i = 0; i < d.length; i += 4) {
+    if (d[i + 3] === 0) continue;
+    const { s, l } = rgbToHsl(d[i], d[i + 1], d[i + 2]);
+    let outS = s;
+    let outL = l;
+    if (s < 0.08) {
+      if (l > 0.95) continue; // keep white
+      outS = 1;
+      outL = l < 0.08 ? 0.42 : l; // lift pure black into a visible color
+    }
+    const [r, g, b] = hslToRgb(targetH, outS, outL);
+    d[i] = r;
+    d[i + 1] = g;
+    d[i + 2] = b;
+  }
+  ctx.putImageData(img, 0, 0);
+}
+
 /** Mirror + scale baked in; rotation is deliberately NOT baked in here — see
  * buildRotatedTileLayer, which rotates the whole repeated sheet as one image
  * instead of rotating the content inside each tile square. */
@@ -83,15 +196,18 @@ function buildPrintTile(
   print: HTMLImageElement,
   layer: CadLayer
 ): HTMLCanvasElement {
-  const tileSize = Math.max(24, Math.round(64 * layer.scale));
+  const tileSize = Math.max(8, Math.round(64 * layer.scale));
   const tile = document.createElement("canvas");
   tile.width = tileSize;
   tile.height = tileSize;
   const tctx = tile.getContext("2d")!;
   tctx.translate(tileSize / 2, tileSize / 2);
   if (layer.mirrored) tctx.scale(-1, 1);
-  tctx.filter = `hue-rotate(${layer.hue}deg)`;
   tctx.drawImage(print, -tileSize / 2, -tileSize / 2, tileSize, tileSize);
+  // Reset transform before putImageData-based recolor (image data is
+  // always in device/backing-store space, not the current CTM).
+  tctx.setTransform(1, 0, 0, 1, 0, 0);
+  applyRecolor(tile, layer.hue);
   return tile;
 }
 
@@ -163,7 +279,6 @@ function renderSingleLayer(
   ctx.translate(layer.single.x, layer.single.y);
   if (layer.mirrored) ctx.scale(-1, 1);
   ctx.rotate((layer.rotation * Math.PI) / 180);
-  ctx.filter = `hue-rotate(${layer.hue}deg)`;
   ctx.drawImage(
     print,
     -layer.single.width / 2,
@@ -172,6 +287,7 @@ function renderSingleLayer(
     layer.single.height
   );
   ctx.restore();
+  applyRecolor(out, layer.hue);
   return out;
 }
 
@@ -190,8 +306,10 @@ function compositeLayer(
   cctx.globalCompositeOperation = "destination-in";
   cctx.drawImage(maskCanvas, 0, 0);
 
+  // source-over so layer order matters (higher Layer N covers lower ones).
+  // multiply was commutative — reordering looked identical.
   ctx.save();
-  ctx.globalCompositeOperation = "multiply";
+  ctx.globalCompositeOperation = "source-over";
   ctx.drawImage(clipped, 0, 0, logicalW, logicalH);
   ctx.restore();
 }
@@ -231,7 +349,8 @@ async function renderLayersToCanvas(
   printImages: Map<string, HTMLImageElement>,
   logicalWidth: number,
   logicalHeight: number,
-  dpr: number
+  dpr: number,
+  garmentClip: HTMLCanvasElement | null
 ) {
   const ctx = getHiDpiContext(canvas, dpr);
   const layout = fitSketch(logicalWidth, logicalHeight, sketch);
@@ -241,12 +360,20 @@ async function renderLayersToCanvas(
   ctx.fillRect(0, 0, logicalWidth, logicalHeight);
   ctx.drawImage(sketch, layout.sx, layout.sy, layout.sw, layout.sh);
 
+  // Array order: index 0 = bottom, last = top (highest Layer N on top).
   for (const layer of layers) {
     if (!layer.printId) continue;
-    const mask = layerMasks.get(layer.id);
-    if (!mask) continue;
     const print = printImages.get(layer.printId);
     if (!print) continue;
+
+    // Single: always clip to the garment silhouette so the CAD can move
+    // freely and anything past the outline is cut off. Tile: use the
+    // per-layer flood/brush mask as before.
+    const mask =
+      layer.placement === "single"
+        ? garmentClip
+        : layerMasks.get(layer.id);
+    if (!mask) continue;
 
     const layerCanvas =
       layer.placement === "tile"
@@ -269,11 +396,49 @@ async function renderLayersToCanvas(
   ctx.restore();
 }
 
-function triggerDownload(dataUrl: string, filename: string) {
-  const a = document.createElement("a");
-  a.href = dataUrl;
-  a.download = filename;
-  a.click();
+/**
+ * Mask of white pixels enclosed by the garment outline (not the page
+ * background). Built by flood-filling exterior white from the edges, then
+ * keeping interior white — used to clip Single placements that spill outside.
+ */
+function buildGarmentClipMask(sketchBuf: HTMLCanvasElement): HTMLCanvasElement {
+  const w = sketchBuf.width;
+  const h = sketchBuf.height;
+  const sctx = sketchBuf.getContext("2d")!;
+  const source = sctx.getImageData(0, 0, w, h);
+  const exterior = new ImageData(w, h);
+
+  const seeds: Array<[number, number]> = [
+    [0, 0],
+    [w - 1, 0],
+    [0, h - 1],
+    [w - 1, h - 1],
+    [Math.floor(w / 2), 0],
+    [0, Math.floor(h / 2)],
+    [w - 1, Math.floor(h / 2)],
+    [Math.floor(w / 2), h - 1],
+  ];
+  for (const [x, y] of seeds) {
+    floodFillToMask(source, exterior, x, y);
+  }
+
+  const mask = document.createElement("canvas");
+  mask.width = w;
+  mask.height = h;
+  const out = mask.getContext("2d")!.createImageData(w, h);
+  const src = source.data;
+  const ext = exterior.data;
+  const dst = out.data;
+  for (let i = 0; i < src.length; i += 4) {
+    if (ext[i + 3] > 128) continue;
+    if (!isWhitePixel(src, i)) continue;
+    dst[i] = 255;
+    dst[i + 1] = 255;
+    dst[i + 2] = 255;
+    dst[i + 3] = 255;
+  }
+  mask.getContext("2d")!.putImageData(out, 0, 0);
+  return mask;
 }
 
 function layerHasFill(mask: HTMLCanvasElement | undefined): boolean {
@@ -306,14 +471,18 @@ export default function CadPage({
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const sketchBufferRef = useRef<HTMLCanvasElement | null>(null);
   const sketchRef = useRef<HTMLImageElement | null>(null);
+  const garmentClipRef = useRef<HTMLCanvasElement | null>(null);
   const layerMasksRef = useRef<Map<string, HTMLCanvasElement>>(new Map());
   const printImagesRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const uploadInputRef = useRef<HTMLInputElement>(null);
+  const uploadCadInputRef = useRef<HTMLInputElement>(null);
   const logicalSizeRef = useRef({ w: 0, h: 0 });
   const dprRef = useRef(1);
 
   const [asset, setAsset] = useState<Asset | null>(null);
+  const [allAssets, setAllAssets] = useState<Asset[]>([]);
   const [chain, setChain] = useState<Asset[]>([]);
+  const [backHref, setBackHref] = useState(`/sketch/${id}`);
   const [prints, setPrints] = useState<Print[]>([]);
   const [layers, setLayers] = useState<CadLayer[]>([]);
   const [activeLayerId, setActiveLayerId] = useState<string | null>(null);
@@ -322,22 +491,49 @@ export default function CadPage({
   const [approving, setApproving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [hint, setHint] = useState(
-    "Add a layer, then click inside the garment outline to fill a region for it."
+    "Click inside the garment outline to fill a region for Layer 1."
   );
+  const [uploadParentId, setUploadParentId] = useState("");
+  const [uploadingCad, setUploadingCad] = useState(false);
+  const [showCadLibrary, setShowCadLibrary] = useState(false);
+  const [showPrintLibrary, setShowPrintLibrary] = useState(false);
+  const [maskMode, setMaskMode] = useState<MaskMode>("fill");
+  const [brushSize, setBrushSize] = useState(DEFAULT_BRUSH_SIZE);
+  /** Screen-space brush preview (null when pointer is off-canvas or in Fill). */
+  const [brushCursor, setBrushCursor] = useState<{
+    x: number;
+    y: number;
+    scale: number;
+  } | null>(null);
 
   const activeLayer = layers.find((l) => l.id === activeLayerId) ?? null;
+  const cadLibrary = allAssets
+    .filter((a) => a.stage === "cad" && a.status === "approved")
+    .sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    );
+  const selectedCad = activeLayer?.printId
+    ? cadLibrary.find((a) => a.id === activeLayer.printId) ??
+      allAssets.find(
+        (a) => a.id === activeLayer.printId && a.stage === "cad"
+      ) ??
+      null
+    : null;
 
+  /** Resolve a layer fill image from the CAD library (preferred), with a
+   * fallback to the legacy print swatch store for older layers. */
   const getPrintImage = useCallback(
-    async (printId: string): Promise<HTMLImageElement | null> => {
-      const meta = prints.find((p) => p.id === printId);
-      if (!meta) return null;
-      const cached = printImagesRef.current.get(meta.src);
+    async (fillId: string): Promise<HTMLImageElement | null> => {
+      const cad = allAssets.find((a) => a.id === fillId && a.stage === "cad");
+      const src = cad?.imageUrl ?? prints.find((p) => p.id === fillId)?.src;
+      if (!src) return null;
+      const cached = printImagesRef.current.get(src);
       if (cached) return cached;
-      const img = await loadImage(meta.src);
-      printImagesRef.current.set(meta.src, img);
+      const img = await loadImage(src);
+      printImagesRef.current.set(src, img);
       return img;
     },
-    [prints]
+    [allAssets, prints]
   );
 
   const ensureSketchBuffer = useCallback((w: number, h: number) => {
@@ -387,7 +583,8 @@ export default function CadPage({
         printImages,
         logicalW,
         logicalH,
-        dprRef.current
+        dprRef.current,
+        garmentClipRef.current
       );
     } catch (err) {
       setError(err instanceof Error ? err.message : "Render failed");
@@ -409,9 +606,27 @@ export default function CadPage({
         if (cancelled) return;
 
         const a: Asset | null = oneData.asset ?? null;
+        const allAssetsList: Asset[] = allData.assets ?? [];
         setAsset(a);
-        setChain(getFullChain(allData.assets ?? [], id));
+        setAllAssets(allAssetsList);
+        setChain(getFullChain(allAssetsList, id));
         setPrints(printsData.prints ?? []);
+
+        if (a?.stage === "cad") {
+          // Back always means "the Line Sketch that led here," even after
+          // one or more rounds of re-editing a previous fill (a cad→cad
+          // chain) — walk ancestors past any intermediate cad assets to the
+          // nearest real sketch.
+          const ancestry = a.parentId
+            ? getAncestorChain(allAssetsList, a.parentId)
+            : [];
+          const sketchAncestor = [...ancestry]
+            .reverse()
+            .find((x) => x.stage === "sketch");
+          setBackHref(sketchAncestor ? `/sketch/${sketchAncestor.id}` : "/");
+        } else {
+          setBackHref(`/sketch/${id}`);
+        }
       } catch {
         if (!cancelled) setAsset(null);
       } finally {
@@ -423,6 +638,12 @@ export default function CadPage({
     };
   }, [id]);
 
+  // Loads whatever image this id points to as the editable base — a sketch
+  // (blank garment, normal fresh-fill case) or a previously-filled cad asset
+  // (reached via "← Back" from Minibody, or opened from the library) — both
+  // are just "the picture to keep filling," so the same setup path covers
+  // both: the prior fill visibly carries over since it's the loaded image,
+  // and it's still fully editable (add more layers, adjust, etc.).
   useEffect(() => {
     if (!asset?.imageUrl) return;
     let cancelled = false;
@@ -440,6 +661,20 @@ export default function CadPage({
           logicalSizeRef.current = { w: logicalW, h: logicalH };
           ensureSketchBuffer(logicalW, logicalH);
           paintSketchBuffer();
+          if (sketchBufferRef.current) {
+            garmentClipRef.current = buildGarmentClipMask(sketchBufferRef.current);
+          }
+
+          if (layers.length === 0) {
+            const layer = createLayer(logicalW, logicalH);
+            const mask = document.createElement("canvas");
+            mask.width = logicalW;
+            mask.height = logicalH;
+            layerMasksRef.current.set(layer.id, mask);
+            setLayers([layer]);
+            setActiveLayerId(layer.id);
+          }
+
           await redraw();
         }
       } catch (err) {
@@ -489,7 +724,29 @@ export default function CadPage({
     setRenderTick((n) => n + 1);
   }
 
+  /** direction "up" = toward top of stack (higher Layer number). */
+  function handleMoveLayer(layerId: string, direction: "up" | "down") {
+    setLayers((ls) => {
+      const i = ls.findIndex((l) => l.id === layerId);
+      if (i < 0) return ls;
+      const j = direction === "up" ? i + 1 : i - 1;
+      if (j < 0 || j >= ls.length) return ls;
+      const next = [...ls];
+      [next[i], next[j]] = [next[j], next[i]];
+      return next;
+    });
+    setRenderTick((n) => n + 1);
+  }
+
   function handleCanvasClick(e: React.MouseEvent<HTMLCanvasElement>) {
+    // Single placement uses the garment clip automatically — Fill clicks
+    // only apply to Tile layers' flood masks.
+    if (activeLayer?.placement === "single") {
+      setHint(
+        "Drag the CAD box to move it. Anything past the garment outline is cut off."
+      );
+      return;
+    }
     if (!activeLayerId) {
       setHint("Add or select a layer first, then click inside the garment outline.");
       return;
@@ -504,15 +761,31 @@ export default function CadPage({
     const x = Math.floor(((e.clientX - rect.left) / rect.width) * logicalW);
     const y = Math.floor(((e.clientY - rect.top) / rect.height) * logicalH);
 
-    const sctx = sketchBuf.getContext("2d")!;
     const mctx = mask.getContext("2d")!;
-    const source = sctx.getImageData(0, 0, sketchBuf.width, sketchBuf.height);
     const maskData = mctx.getImageData(0, 0, mask.width, mask.height);
+    const maskIdx = (y * mask.width + x) * 4;
 
+    // Clicking an already-filled spot removes that connected fill instead
+    // of adding more — a toggle, so Fill mode can also undo mistakes.
+    if (maskData.data[maskIdx + 3] > 128) {
+      const cleared = floodClearMask(maskData, x, y);
+      if (cleared > 0) {
+        mctx.putImageData(maskData, 0, 0);
+        setRenderTick((n) => n + 1);
+        setHint(
+          "Region removed from this layer. Click an enclosed area to fill it, or a filled one to remove it."
+        );
+        setError(null);
+      }
+      return;
+    }
+
+    const sctx = sketchBuf.getContext("2d")!;
+    const source = sctx.getImageData(0, 0, sketchBuf.width, sketchBuf.height);
     const added = floodFillToMask(source, maskData, x, y);
     if (added === 0) {
       setHint(
-        "No fill — click a white area inside a closed garment outline (not on a black line, and not a region already filled by this layer)."
+        "No fill — click a white area inside a closed garment outline (not on a black line)."
       );
       return;
     }
@@ -520,40 +793,182 @@ export default function CadPage({
     mctx.putImageData(maskData, 0, 0);
     setRenderTick((n) => n + 1);
     setHint(
-      "Region added to this layer. Click another enclosed area, or adjust its print/placement."
+      "Region added to this layer. Click a filled area to remove it, or another enclosed area to add more."
     );
     setError(null);
   }
 
-  function resetAllLayers() {
-    layerMasksRef.current.clear();
-    setLayers([]);
-    setActiveLayerId(null);
-    setRenderTick((n) => n + 1);
-    setHint("Layers cleared. Add a layer and click inside the garment to fill again.");
+  function updateBrushCursor(e: React.PointerEvent<HTMLCanvasElement>) {
+    if (maskMode === "fill") {
+      setBrushCursor(null);
+      return;
+    }
+    const rect = e.currentTarget.getBoundingClientRect();
+    const { w } = logicalSizeRef.current;
+    setBrushCursor({
+      x: e.clientX - rect.left,
+      y: e.clientY - rect.top,
+      scale: w > 0 ? rect.width / w : 1,
+    });
   }
 
-  async function handleUploadPrint(e: React.ChangeEvent<HTMLInputElement>) {
+  /** Stamp a circular hole into the mask (clip + clearRect). More reliable
+   * than destination-out for continuous erase strokes across browsers. */
+  function eraseMaskAt(
+    mctx: CanvasRenderingContext2D,
+    x: number,
+    y: number,
+    radius: number
+  ) {
+    mctx.save();
+    mctx.beginPath();
+    mctx.arc(x, y, radius, 0, Math.PI * 2);
+    mctx.clip();
+    mctx.clearRect(x - radius - 1, y - radius - 1, radius * 2 + 2, radius * 2 + 2);
+    mctx.restore();
+  }
+
+  /** Brush/Erase: freeform painting onto the same mask flood-fill writes to
+   * — a continuous stroke (not just discrete stamps) via lineTo, so fast
+   * pointer movement doesn't leave gaps. Erase punches holes via clip+clear. */
+  function handleMaskPointerDown(e: React.PointerEvent<HTMLCanvasElement>) {
+    if (maskMode === "fill") return;
+    if (!activeLayerId) {
+      setHint("Add or select a layer first, then paint its mask.");
+      return;
+    }
+    const canvas = canvasRef.current;
+    const mask = layerMasksRef.current.get(activeLayerId);
+    const { w: logicalW, h: logicalH } = logicalSizeRef.current;
+    if (!canvas || !mask || !logicalW || !logicalH) return;
+    e.preventDefault();
+    updateBrushCursor(e);
+
+    const mctx = mask.getContext("2d")!;
+    const erasing = maskMode === "erase";
+    const radius = brushSize / 2;
+
+    mctx.lineCap = "round";
+    mctx.lineJoin = "round";
+    mctx.lineWidth = brushSize;
+    mctx.strokeStyle = "#ffffff";
+    mctx.fillStyle = "#ffffff";
+    mctx.globalCompositeOperation = "source-over";
+
+    let last = clientToLogical(canvas, logicalW, logicalH, e.clientX, e.clientY);
+    if (erasing) {
+      eraseMaskAt(mctx, last.x, last.y, radius);
+    } else {
+      mctx.beginPath();
+      mctx.arc(last.x, last.y, radius, 0, Math.PI * 2);
+      mctx.fill();
+    }
+    setRenderTick((n) => n + 1);
+
+    function onMove(ev: PointerEvent) {
+      const rect = canvas!.getBoundingClientRect();
+      setBrushCursor({
+        x: ev.clientX - rect.left,
+        y: ev.clientY - rect.top,
+        scale: logicalW > 0 ? rect.width / logicalW : 1,
+      });
+      const pt = clientToLogical(canvas!, logicalW, logicalH, ev.clientX, ev.clientY);
+      if (erasing) {
+        // Stamp along the segment so fast moves don't leave gaps
+        const dist = Math.hypot(pt.x - last.x, pt.y - last.y);
+        const steps = Math.max(1, Math.ceil(dist / Math.max(1, radius * 0.4)));
+        for (let i = 1; i <= steps; i++) {
+          const t = i / steps;
+          eraseMaskAt(
+            mctx,
+            last.x + (pt.x - last.x) * t,
+            last.y + (pt.y - last.y) * t,
+            radius
+          );
+        }
+      } else {
+        mctx.beginPath();
+        mctx.moveTo(last.x, last.y);
+        mctx.lineTo(pt.x, pt.y);
+        mctx.stroke();
+      }
+      last = pt;
+      setRenderTick((n) => n + 1);
+    }
+    function onUp() {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      setHint(
+        erasing
+          ? "Erased from this layer's mask. Switch back to Fill/Brush to keep editing."
+          : "Painted this layer's mask. Switch to Fill to click-fill an enclosed region instead."
+      );
+      setError(null);
+    }
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }
+
+  async function handleUploadFillCad(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
     try {
       const dataUrl = await readFileAsDataUrl(file);
-      const res = await fetch("/api/prints", {
+      const res = await fetch("/api/assets", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          label: file.name.replace(/\.[^.]+$/, ""),
-          dataUrl,
+          stage: "cad",
+          status: "approved",
+          parentId: null,
+          imageUrl: dataUrl,
+          meta: {
+            source: "library-upload",
+            label: file.name.replace(/\.[^.]+$/, ""),
+            fileName: file.name,
+          },
         }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Upload failed");
-      setPrints((ps) => [...ps, data.print]);
-      patchActiveLayer({ printId: data.print.id });
+      const asset = data.asset as Asset;
+      setAllAssets((prev) => [asset, ...prev]);
+      patchActiveLayer({ printId: asset.id });
+      setShowPrintLibrary(false);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Print upload failed");
+      setError(err instanceof Error ? err.message : "CAD upload failed");
     } finally {
       if (uploadInputRef.current) uploadInputRef.current.value = "";
+    }
+  }
+
+  async function handleUploadCad(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploadingCad(true);
+    setError(null);
+    try {
+      const dataUrl = await readFileAsDataUrl(file);
+      const res = await fetch("/api/assets", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          stage: "cad",
+          status: "approved",
+          imageUrl: dataUrl,
+          parentId: uploadParentId || null,
+          meta: { source: "upload-direct" },
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Upload failed");
+      // Stay on CAD Fill with the uploaded fill as the working canvas.
+      router.push(`/cad/${data.asset.id}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Upload failed");
+      setUploadingCad(false);
+    } finally {
+      if (uploadCadInputRef.current) uploadCadInputRef.current.value = "";
     }
   }
 
@@ -626,7 +1041,7 @@ export default function CadPage({
     triggerDownload(canvas.toDataURL("image/png"), `cad-fill-${id.slice(0, 8)}.png`);
   }
 
-  async function handleApproveLive() {
+  async function handleContinue() {
     const canvas = canvasRef.current;
     if (!canvas) return;
     setApproving(true);
@@ -640,7 +1055,7 @@ export default function CadPage({
           stage: "cad",
           parentId: id,
           imageUrl: dataUrl,
-          status: "approved",
+          status: "pending",
           meta: {
             layers: layers.map((l) => ({
               printId: l.printId,
@@ -657,7 +1072,7 @@ export default function CadPage({
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Failed to approve");
-      router.push(`/minibody/${data.asset.id}`);
+      router.push(startFromHref(data.asset as Asset));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Approve failed");
       setApproving(false);
@@ -672,96 +1087,297 @@ export default function CadPage({
     return <p className="text-sm text-accent-orange">Asset not found.</p>;
   }
 
-  const canApprove = layers.some(
-    (l) => l.printId && layerHasFill(layerMasksRef.current.get(l.id))
-  );
+  // Iterating on a previously-filled cad asset already has a valid image to
+  // continue with even before touching anything new this visit.
+  const canApprove =
+    asset.stage === "cad" ||
+    layers.some(
+      (l) =>
+        !!l.printId &&
+        (l.placement === "single" ||
+          layerHasFill(layerMasksRef.current.get(l.id)))
+    );
   const { w: logicalW, h: logicalH } = logicalSizeRef.current;
+  const sketchOptions = allAssets.filter(
+    (a) => a.stage === "sketch" && a.status === "approved"
+  );
+  const previousCads = cadLibrary.filter((a) => a.id !== id);
+  const paintPopupOpen = maskMode === "brush" || maskMode === "erase";
 
   return (
-    <div className="mx-auto max-w-5xl space-y-8">
+    <div className="mx-auto max-w-6xl space-y-4">
       <StageStepper current="cad" chain={chain} />
 
-      <div className="space-y-2">
+      <div className="space-y-0.5">
         <Link
-          href={`/sketch/${id}`}
+          href={backHref}
           className="inline-flex items-center gap-1 text-xs font-medium text-cream-muted transition hover:text-cream"
         >
-          ← Back to Line Sketch
+          ← Back
         </Link>
-        <h1 className="text-2xl font-semibold tracking-tight">CAD Fill</h1>
+        <h1 className="text-xl font-semibold tracking-tight">CAD Fill</h1>
         <p className="text-sm text-cream-muted">
-          Add a layer, fill a region for it, then give that layer its own
-          print and placement — tile it across the region, or place it once
-          and drag/resize it by hand.
+          {asset.stage === "cad"
+            ? "Picking up your previous fill — add layers, adjust, or continue as-is."
+            : "Mask a region, pick a CAD, tune placement — then continue to Minibody."}
         </p>
       </div>
 
-      <div className="grid gap-8 lg:grid-cols-[1fr_280px]">
-        <div className="space-y-3">
-          <div className="mx-auto max-w-[640px] overflow-hidden rounded-lg border border-navy-50 bg-white">
-            <div className="relative">
-              <canvas
-                ref={canvasRef}
-                onClick={handleCanvasClick}
-                className="block h-auto w-full cursor-crosshair"
-              />
-              {activeLayer && activeLayer.placement === "single" && logicalW > 0 && (
-                <div
-                  className="absolute cursor-move border-2 border-dashed border-accent-orange bg-accent-orange/10"
-                  style={{
-                    left: `${
-                      ((activeLayer.single.x - activeLayer.single.width / 2) /
-                        logicalW) *
-                      100
-                    }%`,
-                    top: `${
-                      ((activeLayer.single.y - activeLayer.single.height / 2) /
-                        logicalH) *
-                      100
-                    }%`,
-                    width: `${(activeLayer.single.width / logicalW) * 100}%`,
-                    height: `${(activeLayer.single.height / logicalH) * 100}%`,
-                  }}
-                  onPointerDown={handleDragStart}
-                >
-                  <div
-                    className="absolute -bottom-1.5 -right-1.5 h-3 w-3 cursor-nwse-resize rounded-full border border-navy bg-accent-orange"
-                    onPointerDown={handleResizeStart}
-                  />
+      <div className="grid items-start gap-5 lg:grid-cols-[1fr_300px]">
+        <div className="space-y-2">
+          <div
+            className={
+              paintPopupOpen
+                ? "fixed inset-0 z-50 flex flex-col bg-navy/95 p-4 sm:p-6"
+                : "mx-auto w-fit"
+            }
+            {...(paintPopupOpen
+              ? {
+                  role: "dialog" as const,
+                  "aria-modal": true as const,
+                  "aria-label": "Mask paint tools",
+                }
+              : {})}
+          >
+            {paintPopupOpen ? (
+              <div className="mx-auto mb-4 flex w-full max-w-6xl flex-wrap items-center justify-between gap-3">
+                <div>
+                  <h2 className="text-sm font-semibold text-cream">
+                    {maskMode === "erase" ? "Erase mask" : "Brush mask"}
+                  </h2>
+                  <p className="text-xs text-cream-muted">
+                    Paint on a larger canvas, then Done when finished.
+                  </p>
                 </div>
-              )}
+                <div className="flex flex-wrap items-center gap-3">
+                  <div className="flex gap-1">
+                    {(
+                      [
+                        { key: "fill", label: "Fill" },
+                        { key: "brush", label: "Brush" },
+                        { key: "erase", label: "Erase" },
+                      ] as const
+                    ).map((m) => (
+                      <button
+                        key={m.key}
+                        type="button"
+                        onClick={() => {
+                          setMaskMode(m.key);
+                          if (m.key === "fill") setBrushCursor(null);
+                        }}
+                        className={[
+                          "rounded-md border px-3 py-1.5 text-xs font-medium transition",
+                          maskMode === m.key
+                            ? "border-accent-blue bg-accent-blue/10 text-cream"
+                            : "border-navy-50 text-cream-muted hover:border-cream-muted",
+                        ].join(" ")}
+                      >
+                        {m.label}
+                      </button>
+                    ))}
+                  </div>
+                  <label className="flex min-w-[12rem] items-center gap-2 text-xs text-cream-muted">
+                    <span className="shrink-0">Brush size</span>
+                    <input
+                      type="range"
+                      min={8}
+                      max={160}
+                      value={brushSize}
+                      onChange={(e) => setBrushSize(Number(e.target.value))}
+                      className="w-40 accent-accent-blue"
+                    />
+                    <span className="shrink-0">{brushSize}px</span>
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setBrushCursor(null);
+                      setMaskMode("fill");
+                    }}
+                    className="rounded-md bg-accent-blue px-3 py-1.5 text-xs font-semibold text-navy transition hover:brightness-110"
+                  >
+                    Done
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="mb-1.5 flex items-center justify-between gap-2">
+                <h2 className="text-xs font-medium uppercase tracking-wider text-cream-muted">
+                  CAD fill
+                </h2>
+                <button
+                  type="button"
+                  disabled={!canApprove}
+                  onClick={handleDownload}
+                  className="text-xs font-medium text-accent-blue transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  Download
+                </button>
+              </div>
+            )}
+            <div
+              className={
+                paintPopupOpen
+                  ? "mx-auto flex min-h-0 w-full max-w-6xl flex-1 items-center justify-center"
+                  : "overflow-hidden rounded-lg border border-navy-50 bg-white"
+              }
+            >
+              <div
+                className={
+                  paintPopupOpen
+                    ? "relative max-h-full max-w-full overflow-hidden rounded-lg border border-navy-50 bg-white shadow-lg"
+                    : "relative"
+                }
+              >
+                <canvas
+                  ref={canvasRef}
+                  onClick={maskMode === "fill" ? handleCanvasClick : undefined}
+                  onPointerDown={
+                    maskMode !== "fill" ? handleMaskPointerDown : undefined
+                  }
+                  onPointerMove={
+                    maskMode !== "fill" ? updateBrushCursor : undefined
+                  }
+                  onPointerLeave={() => setBrushCursor(null)}
+                  className={[
+                    // Height-capped (not width-capped) so tall portrait source
+                    // images can't balloon the page past one laptop screen —
+                    // width follows automatically to preserve aspect ratio.
+                    paintPopupOpen
+                      ? "block max-h-[min(80vh,56rem)] w-auto"
+                      : "block max-h-[min(50vh,28rem)] w-auto",
+                    maskMode === "fill" ? "cursor-crosshair" : "cursor-none",
+                  ].join(" ")}
+                />
+                {brushCursor && maskMode !== "fill" && (
+                  <div
+                    aria-hidden
+                    className="pointer-events-none absolute rounded-full border-[1.5px] border-black"
+                    style={{
+                      left: brushCursor.x,
+                      top: brushCursor.y,
+                      width: brushSize * brushCursor.scale,
+                      height: brushSize * brushCursor.scale,
+                      transform: "translate(-50%, -50%)",
+                      boxShadow: "0 0 0 1px rgba(255,255,255,0.95)",
+                    }}
+                  />
+                )}
+                {activeLayer &&
+                  activeLayer.placement === "single" &&
+                  logicalW > 0 && (
+                    <div
+                      className="absolute cursor-move border-2 border-dashed border-accent-blue bg-accent-blue/10"
+                      style={{
+                        left: `${
+                          ((activeLayer.single.x -
+                            activeLayer.single.width / 2) /
+                            logicalW) *
+                          100
+                        }%`,
+                        top: `${
+                          ((activeLayer.single.y -
+                            activeLayer.single.height / 2) /
+                            logicalH) *
+                          100
+                        }%`,
+                        width: `${
+                          (activeLayer.single.width / logicalW) * 100
+                        }%`,
+                        height: `${
+                          (activeLayer.single.height / logicalH) * 100
+                        }%`,
+                      }}
+                      onPointerDown={handleDragStart}
+                    >
+                      <div
+                        className="absolute -bottom-1.5 -right-1.5 h-3 w-3 cursor-nwse-resize rounded-full border border-navy bg-accent-blue"
+                        onPointerDown={handleResizeStart}
+                      />
+                    </div>
+                  )}
+              </div>
             </div>
           </div>
-          <div className="flex items-center justify-between gap-3">
-            <p className="text-xs text-cream-muted">{hint}</p>
-            <button
-              type="button"
-              onClick={handleDownload}
-              disabled={!canApprove}
-              className="shrink-0 text-xs font-medium text-accent-blue transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              Download
-            </button>
-          </div>
+          <p className="text-xs text-cream-muted">{hint}</p>
+
+          {activeLayerId && !paintPopupOpen && (
+            <div className="flex flex-wrap items-center gap-3 rounded-md border border-navy-50 p-3">
+              <div className="flex gap-1">
+                {(
+                  [
+                    { key: "fill", label: "Fill" },
+                    { key: "brush", label: "Brush" },
+                    { key: "erase", label: "Erase" },
+                  ] as const
+                ).map((m) => (
+                  <button
+                    key={m.key}
+                    type="button"
+                    onClick={() => {
+                      setMaskMode(m.key);
+                      if (m.key === "fill") setBrushCursor(null);
+                    }}
+                    className={[
+                      "rounded-md border px-3 py-1.5 text-xs font-medium transition",
+                      maskMode === m.key
+                        ? "border-accent-blue bg-accent-blue/10 text-cream"
+                        : "border-navy-50 text-cream-muted hover:border-cream-muted",
+                    ].join(" ")}
+                  >
+                    {m.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
           {!asset.imageUrl && (
             <p className="text-sm text-accent-orange">
               This asset has no sketch image to fill.
             </p>
           )}
+
+          {error && (
+            <p className="rounded-md border border-accent-orange/40 bg-accent-orange/10 px-3 py-2 text-sm text-accent-orange">
+              {error}
+            </p>
+          )}
+
+          <ApprovalBar
+            disabled={!canApprove || approving}
+            onContinue={handleContinue}
+            continueLabel={approving ? "Saving…" : "Continue to Minibody →"}
+          />
         </div>
 
-        <aside className="space-y-6">
-          <section className="space-y-3">
+        <aside className="max-h-[calc(100vh-10rem)] space-y-3 overflow-y-auto pr-1">
+          <section className="space-y-2">
             <h2 className="text-xs font-medium uppercase tracking-wider text-cream-muted">
               Layers
             </h2>
+            <p className="text-[11px] text-cream-muted">
+              Highest number sits on top. Use ↑ / ↓ to reorder.
+            </p>
             {layers.length === 0 ? (
               <p className="text-xs text-cream-muted">No layers yet.</p>
             ) : (
               <ul className="space-y-1.5">
-                {layers.map((l, idx) => {
-                  const print = prints.find((p) => p.id === l.printId);
-                  const filled = layerHasFill(layerMasksRef.current.get(l.id));
+                {[...layers]
+                  .map((l, idx) => ({ l, idx }))
+                  .reverse()
+                  .map(({ l, idx }) => {
+                  const fillCad = allAssets.find(
+                    (a) => a.id === l.printId && a.stage === "cad"
+                  );
+                  const legacyPrint = prints.find((p) => p.id === l.printId);
+                  const thumbSrc = fillCad?.imageUrl || legacyPrint?.src;
+                  const filled =
+                    l.placement === "single"
+                      ? !!l.printId
+                      : layerHasFill(layerMasksRef.current.get(l.id));
+                  const isTop = idx === layers.length - 1;
+                  const isBottom = idx === 0;
                   return (
                     <li
                       key={l.id}
@@ -773,11 +1389,37 @@ export default function CadPage({
                           : "border-navy-50 hover:border-cream-muted",
                       ].join(" ")}
                     >
+                      <span className="flex shrink-0 flex-col gap-0.5">
+                        <button
+                          type="button"
+                          disabled={isTop}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleMoveLayer(l.id, "up");
+                          }}
+                          aria-label={`Move layer ${idx + 1} up`}
+                          className="leading-none text-cream-muted transition hover:text-cream disabled:opacity-30"
+                        >
+                          ↑
+                        </button>
+                        <button
+                          type="button"
+                          disabled={isBottom}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleMoveLayer(l.id, "down");
+                          }}
+                          aria-label={`Move layer ${idx + 1} down`}
+                          className="leading-none text-cream-muted transition hover:text-cream disabled:opacity-30"
+                        >
+                          ↓
+                        </button>
+                      </span>
                       <span className="h-6 w-6 shrink-0 overflow-hidden rounded border border-navy-50 bg-navy">
-                        {print && (
+                        {thumbSrc && (
                           // eslint-disable-next-line @next/next/no-img-element
                           <img
-                            src={print.src}
+                            src={thumbSrc}
                             alt=""
                             className="h-full w-full object-cover"
                           />
@@ -785,6 +1427,7 @@ export default function CadPage({
                       </span>
                       <span className="flex-1 truncate text-cream-muted">
                         Layer {idx + 1}
+                        {isTop ? " · top" : ""}
                         {!filled && " (empty)"}
                       </span>
                       <button
@@ -816,47 +1459,106 @@ export default function CadPage({
             <>
               <section className="space-y-3">
                 <h2 className="text-xs font-medium uppercase tracking-wider text-cream-muted">
-                  Print
+                  CAD
                 </h2>
-                <div className="grid grid-cols-2 gap-2">
+                {selectedCad && (
+                  <div className="flex items-center gap-2 rounded-md border border-accent-blue/40 bg-accent-blue/5 p-2">
+                    {selectedCad.imageUrl && (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img
+                        src={selectedCad.imageUrl}
+                        alt=""
+                        className="h-10 w-10 rounded border border-navy-50 object-cover"
+                      />
+                    )}
+                    <span className="truncate text-xs text-cream">
+                      {typeof selectedCad.meta?.label === "string"
+                        ? selectedCad.meta.label
+                        : `CAD ${selectedCad.id.slice(0, 8)}`}
+                    </span>
+                  </div>
+                )}
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowPrintLibrary((v) => !v)}
+                    className="rounded-md border border-navy-50 px-3 py-1.5 text-xs font-medium text-cream-muted transition hover:border-cream-muted hover:text-cream"
+                  >
+                    {showPrintLibrary
+                      ? "Hide CAD Library"
+                      : "Search CAD Library"}
+                  </button>
                   <button
                     type="button"
                     onClick={() => uploadInputRef.current?.click()}
-                    className="flex aspect-square flex-col items-center justify-center gap-1 rounded-md border border-dashed border-navy-50 text-cream-muted transition hover:border-accent-blue hover:text-cream"
+                    className="rounded-md border border-dashed border-navy-50 px-3 py-1.5 text-xs font-medium text-cream-muted transition hover:border-accent-blue hover:text-cream"
                   >
-                    <span className="text-lg leading-none">+</span>
-                    <span className="text-[10px]">Upload</span>
+                    + Upload CAD
                   </button>
-                  {prints.map((p) => (
-                    <button
-                      key={p.id}
-                      type="button"
-                      onClick={() => patchActiveLayer({ printId: p.id })}
-                      className={[
-                        "overflow-hidden rounded-md border p-1 transition",
-                        activeLayer.printId === p.id
-                          ? "border-accent-blue ring-1 ring-accent-blue"
-                          : "border-navy-50 hover:border-cream-muted",
-                      ].join(" ")}
-                    >
-                      {/* eslint-disable-next-line @next/next/no-img-element */}
-                      <img
-                        src={p.src}
-                        alt={p.label}
-                        className="aspect-square w-full object-cover"
-                      />
-                      <span className="mt-1 block truncate text-center text-[10px] text-cream-muted">
-                        {p.label}
-                      </span>
-                    </button>
-                  ))}
                 </div>
+                {showPrintLibrary && (
+                  <div className="max-h-52 overflow-y-auto rounded-md border border-navy-50 bg-navy-100/40 p-2">
+                    {cadLibrary.length === 0 ? (
+                      <p className="px-2 py-6 text-center text-[11px] text-cream-muted">
+                        No CADs in the library yet — upload one to get started.
+                      </p>
+                    ) : (
+                      <div className="grid grid-cols-3 gap-2">
+                        {cadLibrary.map((cad) => {
+                          const selected = activeLayer.printId === cad.id;
+                          const label =
+                            typeof cad.meta?.label === "string"
+                              ? cad.meta.label
+                              : cad.id.slice(0, 8);
+                          return (
+                            <button
+                              key={cad.id}
+                              type="button"
+                              onClick={() => {
+                                patchActiveLayer({ printId: cad.id });
+                                setShowPrintLibrary(false);
+                              }}
+                              title={label}
+                              className={[
+                                "group flex flex-col gap-1 rounded-md p-1 text-left transition",
+                                selected
+                                  ? "bg-accent-blue/15 ring-2 ring-accent-blue"
+                                  : "hover:bg-navy-50/60",
+                              ].join(" ")}
+                            >
+                              <div
+                                className={[
+                                  "aspect-square overflow-hidden rounded border bg-white",
+                                  selected
+                                    ? "border-accent-blue"
+                                    : "border-navy-50",
+                                ].join(" ")}
+                              >
+                                {cad.imageUrl && (
+                                  // eslint-disable-next-line @next/next/no-img-element
+                                  <img
+                                    src={cad.imageUrl}
+                                    alt=""
+                                    className="h-full w-full object-cover"
+                                  />
+                                )}
+                              </div>
+                              <span className="line-clamp-2 px-0.5 text-center text-[10px] leading-tight text-cream-muted group-hover:text-cream">
+                                {label}
+                              </span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )}
                 <input
                   ref={uploadInputRef}
                   type="file"
                   accept="image/*"
                   className="hidden"
-                  onChange={handleUploadPrint}
+                  onChange={handleUploadFillCad}
                 />
               </section>
 
@@ -879,7 +1581,12 @@ export default function CadPage({
                   </button>
                   <button
                     type="button"
-                    onClick={() => patchActiveLayer({ placement: "single" })}
+                    onClick={() => {
+                      patchActiveLayer({ placement: "single" });
+                      setHint(
+                        "Drag the CAD box anywhere on the garment. Spill past the outline is cut off."
+                      );
+                    }}
                     className={[
                       "flex-1 rounded-md border px-3 py-1.5 text-xs font-medium transition",
                       activeLayer.placement === "single"
@@ -887,13 +1594,13 @@ export default function CadPage({
                         : "border-navy-50 text-cream-muted hover:border-cream-muted",
                     ].join(" ")}
                   >
-                    Single, centered
+                    Single
                   </button>
                 </div>
                 {activeLayer.placement === "single" && (
                   <p className="text-[11px] text-cream-muted">
-                    Drag the box on the canvas to reposition; drag its corner
-                    handle to resize.
+                    Drag the box to move, corner handle to resize. Anything
+                    outside the garment outline is clipped.
                   </p>
                 )}
               </section>
@@ -906,19 +1613,23 @@ export default function CadPage({
                 {activeLayer.placement === "tile" && (
                   <label className="block space-y-1">
                     <div className="flex justify-between text-xs text-cream-muted">
-                      <span>Scale</span>
+                      <span>CAD size</span>
                       <span>{Math.round(activeLayer.scale * 100)}%</span>
                     </div>
                     <input
                       type="range"
-                      min={50}
-                      max={200}
+                      min={10}
+                      max={400}
                       value={Math.round(activeLayer.scale * 100)}
                       onChange={(e) =>
                         patchActiveLayer({ scale: Number(e.target.value) / 100 })
                       }
                       className="w-full accent-accent-blue"
                     />
+                    <p className="text-[11px] text-cream-muted">
+                      Smaller = more, denser repeats; larger = fewer, bigger
+                      repeats.
+                    </p>
                   </label>
                 )}
 
@@ -941,8 +1652,8 @@ export default function CadPage({
 
                 <label className="block space-y-1">
                   <div className="flex justify-between text-xs text-cream-muted">
-                    <span>Recolor (hue)</span>
-                    <span>{activeLayer.hue}°</span>
+                    <span>Recolor</span>
+                    <span>{activeLayer.hue === 0 ? "original" : `${activeLayer.hue}°`}</span>
                   </div>
                   <input
                     type="range"
@@ -952,43 +1663,83 @@ export default function CadPage({
                     onChange={(e) =>
                       patchActiveLayer({ hue: Number(e.target.value) })
                     }
-                    className="w-full accent-accent-orange"
+                    className="w-full accent-accent-blue"
                   />
                 </label>
 
-                <label className="flex items-center gap-2 text-sm">
-                  <input
-                    type="checkbox"
-                    checked={activeLayer.mirrored}
-                    onChange={(e) =>
-                      patchActiveLayer({ mirrored: e.target.checked })
-                    }
-                    className="accent-accent-blue"
-                  />
-                  Mirror print
-                </label>
+                <Toggle
+                  checked={activeLayer.mirrored}
+                  onChange={(mirrored) => patchActiveLayer({ mirrored })}
+                  label="Mirror CAD"
+                />
               </section>
             </>
           ) : (
             <p className="text-xs text-cream-muted">
-              Add a layer to choose a print and start filling regions.
+              Add a layer to choose a CAD and start filling regions.
             </p>
           )}
         </aside>
       </div>
 
-      {error && (
-        <p className="rounded-md border border-accent-orange/40 bg-accent-orange/10 px-3 py-2 text-sm text-accent-orange">
-          {error}
+      <section className="space-y-3 rounded-lg border border-navy-50 p-4">
+        <h2 className="text-sm font-medium text-cream">
+          Use your own CAD fill
+        </h2>
+        <p className="text-xs text-cream-muted">
+          Upload a filled sketch, or search the CAD library to reopen one.
         </p>
-      )}
-
-      <ApprovalBar
-        disabled={!canApprove || approving}
-        onApprove={handleApproveLive}
-        onDiscard={resetAllLayers}
-        approveLabel={approving ? "Approving…" : "Approve → Minibody"}
-      />
+        <div className="flex flex-wrap items-center gap-3">
+          <label className="inline-flex cursor-pointer items-center">
+            <span className="rounded-md bg-accent-blue px-3 py-2 text-sm font-semibold text-navy transition hover:brightness-110">
+              {uploadingCad ? "Uploading…" : "Choose CAD Fill"}
+            </span>
+            <input
+              ref={uploadCadInputRef}
+              type="file"
+              accept="image/*"
+              disabled={uploadingCad}
+              onChange={handleUploadCad}
+              className="sr-only"
+            />
+          </label>
+          {previousCads.length > 0 && (
+            <button
+              type="button"
+              disabled={uploadingCad}
+              onClick={() => setShowCadLibrary((v) => !v)}
+              className="rounded-md border border-navy-50 px-3 py-2 text-sm font-medium text-cream-muted transition hover:border-cream-muted hover:text-cream disabled:opacity-40"
+            >
+              {showCadLibrary ? "Hide CAD Library" : "Search CAD Library"}
+            </button>
+          )}
+        </div>
+        {showCadLibrary && previousCads.length > 0 && (
+          <AssetThumbPicker
+            assets={previousCads}
+            disabled={uploadingCad}
+            onSelect={(nextId) => {
+              if (!nextId) return;
+              router.push(`/cad/${nextId}`);
+            }}
+          />
+        )}
+        {sketchOptions.length > 0 && (
+          <div className="space-y-1.5">
+            <p className="text-xs text-cream-muted">
+              When uploading, optionally link to a line sketch
+            </p>
+            <AssetThumbPicker
+              assets={sketchOptions}
+              selectedId={uploadParentId || null}
+              allowNone
+              noneLabel="Standalone"
+              disabled={uploadingCad}
+              onSelect={(nextId) => setUploadParentId(nextId ?? "")}
+            />
+          </div>
+        )}
+      </section>
     </div>
   );
 }

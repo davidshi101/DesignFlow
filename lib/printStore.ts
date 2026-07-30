@@ -12,10 +12,10 @@ const DATA_DIR = path.join(process.cwd(), "data");
 const STORE_PATH = path.join(DATA_DIR, "prints.json");
 
 const PLACEHOLDERS: Omit<Print, "createdAt">[] = [
-  { id: "floral", label: "Floral", src: "/prints/floral.png" },
-  { id: "stripe", label: "Stripe", src: "/prints/stripe.png" },
-  { id: "check", label: "Check", src: "/prints/check.png" },
-  { id: "dots", label: "Dots", src: "/prints/dots.png" },
+  { id: "black", label: "Black", src: "/prints/black.svg" },
+  { id: "white", label: "White", src: "/prints/white.svg" },
+  { id: "pattern", label: "Pattern", src: "/prints/pattern.svg" },
+  { id: "word", label: "Word mark", src: "/prints/word.svg" },
 ];
 
 async function ensureStore(): Promise<void> {

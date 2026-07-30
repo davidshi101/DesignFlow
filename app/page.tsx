@@ -1,17 +1,17 @@
 import Link from "next/link";
 import { getAssets, type Asset } from "@/lib/store";
-import { getAncestorChain, stageHref } from "@/lib/chain";
-import DownloadLink from "@/components/DownloadLink";
+import { getAncestorChain, type Stage } from "@/lib/chain";
+import RecentDesigns, { type DesignRow } from "@/components/RecentDesigns";
+import QuickStartCards from "@/components/QuickStartCards";
 
-interface DesignGroup {
-  root: Asset;
-  leaves: Asset[];
-  lastActivity: number;
-}
+const RECENT_DESIGNS_LIMIT = 10;
 
-function groupByDesign(assets: Asset[]): DesignGroup[] {
+/** One row per root design, resolved down to its most-recently-active
+ * branch's Sketch/CAD/Minibody outputs. A design with multiple in-progress
+ * branches only shows its most recent one here — full branch history stays
+ * reachable via the stage Library pages. */
+function buildRecentDesignRows(assets: Asset[]): DesignRow[] {
   const byRoot = new Map<string, Asset[]>();
-
   for (const asset of assets) {
     const chain = getAncestorChain(assets, asset.id);
     const root = chain[0] ?? asset;
@@ -20,119 +20,169 @@ function groupByDesign(assets: Asset[]): DesignGroup[] {
     byRoot.set(root.id, group);
   }
 
-  const groups: DesignGroup[] = [];
-  for (const entry of Array.from(byRoot.entries())) {
-    const [rootId, members] = entry;
-    const root = members.find((a: Asset) => a.id === rootId) ?? members[0];
-    const leaves = members.filter((a: Asset) => {
-      if (a.status === "discarded") return false;
-      const hasActiveChild = members.some(
-        (child: Asset) =>
-          child.parentId === a.id && child.status !== "discarded"
-      );
-      return !hasActiveChild;
-    });
-    if (leaves.length === 0) continue; // whole tree discarded — hide it
+  const rows: (DesignRow & { lastActivity: number })[] = [];
+  for (const [rootId, members] of Array.from(byRoot.entries())) {
+    const rootAsset = members.find((m) => m.id === rootId) ?? null;
+    if (rootAsset?.meta?.dismissedFromRecent === true) continue;
 
-    const lastActivity = Math.max(
-      ...members.map((a: Asset) => new Date(a.createdAt).getTime())
+    // Include discarded leaves — Review may uncheck library save, but the
+    // run should still appear under Recent Designs with the same tiles.
+    const leaves = members.filter((a) => {
+      const hasChild = members.some((child) => child.parentId === a.id);
+      return !hasChild;
+    });
+    if (leaves.length === 0) continue;
+
+    const leaf = leaves.reduce((latest, a) =>
+      new Date(a.createdAt).getTime() > new Date(latest.createdAt).getTime()
+        ? a
+        : latest
     );
-    groups.push({ root, leaves, lastActivity });
+
+    const ancestry = [...getAncestorChain(members, leaf.id)].reverse();
+    const findStage = (s: Stage) => ancestry.find((a) => a.stage === s) ?? null;
+
+    const garment = findStage("garment");
+    const sketch = findStage("sketch");
+    const cad = findStage("cad");
+    const minibody = findStage("minibody");
+    // Library-only roots (placeholders / imports / uploads) aren't designs
+    // in progress — skip when every member is a library-* source.
+    const allLibraryOnly = members.every((m) => {
+      const src = m.meta?.source;
+      return typeof src === "string" && src.startsWith("library-");
+    });
+    if (allLibraryOnly) continue;
+    // Anything that reached Review (has a minibody) or produced a sketch
+    // counts — regardless of whether those outputs were saved to the library.
+    if (!sketch && !minibody) continue;
+
+    rows.push({
+      rootId,
+      garment,
+      sketch,
+      cad,
+      minibody,
+      lastActivity: new Date(leaf.createdAt).getTime(),
+    });
   }
 
-  groups.sort((a, b) => b.lastActivity - a.lastActivity);
-  return groups;
+  rows.sort((a, b) => b.lastActivity - a.lastActivity);
+  return rows.slice(0, RECENT_DESIGNS_LIMIT);
+}
+
+function SketchesIcon() {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" className="h-5 w-5">
+      <rect x="4" y="2.5" width="12" height="15" rx="1.5" stroke="currentColor" strokeWidth="1.4" />
+      <path d="M7 7h6M7 10h6M7 13h3.5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function GarmentsIcon() {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" className="h-5 w-5">
+      <path
+        d="M7 3.2 10 5l3-1.8 3 3-2 2v8.1H6V8.4l-2-2 3-3z"
+        stroke="currentColor"
+        strokeWidth="1.4"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function MinibodiesIcon() {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" className="h-5 w-5">
+      <circle cx="10" cy="5" r="2.3" stroke="currentColor" strokeWidth="1.4" />
+      <path
+        d="M5.5 17c0-3.6 2-5.7 4.5-5.7s4.5 2.1 4.5 5.7"
+        stroke="currentColor"
+        strokeWidth="1.4"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
+function CadsIcon() {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" className="h-5 w-5">
+      <rect x="2.5" y="3.5" width="15" height="10" rx="1.2" stroke="currentColor" strokeWidth="1.4" />
+      <path d="M7 17h6M10 13.5v3.5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+    </svg>
+  );
 }
 
 export default async function HomePage() {
   const assets = await getAssets();
-  const groups = groupByDesign(assets);
+  const recentRows = buildRecentDesignRows(assets);
+  const active = (stage: Stage) =>
+    assets.filter((a) => a.stage === stage && a.status === "approved").length;
+
+  const memoryBank = [
+    { key: "sketches", label: "Sketches", icon: SketchesIcon, href: "/library/sketch", count: active("sketch") },
+    { key: "cads", label: "CADs", icon: CadsIcon, href: "/library/cad", count: active("cad") },
+    { key: "minibodies", label: "Minibodies", icon: MinibodiesIcon, href: "/library/minibody", count: active("minibody") },
+    { key: "garments", label: "Garments", icon: GarmentsIcon, href: "/library/garment", count: active("garment") },
+  ];
 
   return (
-    <div className="mx-auto max-w-3xl space-y-8">
-      <div className="space-y-3">
-        <h1 className="text-3xl font-semibold tracking-tight">
-          Design pipeline
-        </h1>
-        <p className="text-cream-muted max-w-xl">
-          Garment → Line Sketch → CAD Fill → Minibody.
+    <div className="mx-auto max-w-5xl space-y-6">
+      <div className="space-y-1">
+        <h1 className="text-3xl font-semibold tracking-tight">Design Pipeline</h1>
+        <p className="text-sm text-cream-muted">
+          Garment → Line sketch → CAD Fill → Minibody
         </p>
+      </div>
+
+      <div className="grid gap-5 md:grid-cols-2">
         <Link
           href="/new"
-          className="inline-flex rounded-md bg-accent-blue px-4 py-2 text-sm font-semibold text-navy transition hover:brightness-110"
+          className="group flex flex-col items-center justify-center gap-3 rounded-lg border border-navy-50 bg-navy-100 px-6 py-12 text-center transition hover:border-accent-blue"
         >
-          New design
+          <span className="flex h-12 w-12 items-center justify-center rounded-full bg-accent-blue text-2xl font-semibold text-navy transition group-hover:brightness-110">
+            +
+          </span>
+          <span className="text-lg font-semibold">New Design</span>
+          <span className="max-w-[26rem] text-sm text-cream-muted">
+            Start from a garment photo, in four steps, and then a finished
+            minibody render.
+          </span>
         </Link>
+
+        <div className="grid grid-cols-2 gap-3">
+          {memoryBank.map((card) => {
+            const Icon = card.icon;
+            return (
+              <Link
+                key={card.key}
+                href={card.href}
+                className="flex flex-col items-start gap-2 rounded-lg border border-navy-50 bg-navy-100 p-4 transition hover:border-cream-muted"
+              >
+                <Icon />
+                <span className="text-sm font-medium">{card.label}</span>
+                <span className="text-xs text-cream-muted">{card.count} items</span>
+              </Link>
+            );
+          })}
+        </div>
       </div>
+
+      <section className="space-y-2">
+        <h2 className="text-sm font-medium uppercase tracking-wider text-cream-muted">
+          Already further along?
+        </h2>
+        <QuickStartCards />
+      </section>
 
       <section className="space-y-3">
         <h2 className="text-sm font-medium uppercase tracking-wider text-cream-muted">
-          Designs
+          Recent Designs
         </h2>
-        {groups.length === 0 ? (
-          <p className="text-sm text-cream-muted">
-            No designs yet. Start a new one.
-          </p>
-        ) : (
-          <ul className="space-y-3">
-            {groups.map((group) => (
-              <li
-                key={group.root.id}
-                className="overflow-hidden rounded-lg border border-navy-50"
-              >
-                <div className="flex items-center gap-3 bg-navy-100 px-4 py-3">
-                  {group.root.imageUrl && (
-                    // eslint-disable-next-line @next/next/no-img-element
-                    <img
-                      src={group.root.imageUrl}
-                      alt=""
-                      className="h-10 w-10 shrink-0 rounded object-cover"
-                    />
-                  )}
-                  <span className="truncate font-mono text-xs text-cream-muted">
-                    Design {group.root.id.slice(0, 8)}
-                  </span>
-                  {group.leaves.length > 1 && (
-                    <span className="shrink-0 rounded bg-navy px-2 py-0.5 text-[10px] text-cream-muted">
-                      {group.leaves.length} branches in progress
-                    </span>
-                  )}
-                </div>
-                <ul className="divide-y divide-navy-50">
-                  {group.leaves.map((leaf) => (
-                    <li
-                      key={leaf.id}
-                      className="flex items-center justify-between gap-4 px-4 py-3 transition hover:bg-navy-50"
-                    >
-                      <Link
-                        href={stageHref(leaf)}
-                        className="flex min-w-0 flex-1 items-center gap-3 truncate text-sm"
-                      >
-                        {leaf.imageUrl && (
-                          // eslint-disable-next-line @next/next/no-img-element
-                          <img
-                            src={leaf.imageUrl}
-                            alt=""
-                            className="h-8 w-8 shrink-0 rounded object-cover"
-                          />
-                        )}
-                        <span className="shrink-0 rounded bg-navy-100 px-2 py-0.5 text-xs capitalize text-accent-blue">
-                          {leaf.stage} · {leaf.status}
-                        </span>
-                      </Link>
-                      {leaf.imageUrl && (
-                        <DownloadLink
-                          dataUrl={leaf.imageUrl}
-                          filename={`${leaf.stage}-${leaf.id.slice(0, 8)}.png`}
-                        />
-                      )}
-                    </li>
-                  ))}
-                </ul>
-              </li>
-            ))}
-          </ul>
-        )}
+        <RecentDesigns initialRows={recentRows} />
       </section>
     </div>
   );

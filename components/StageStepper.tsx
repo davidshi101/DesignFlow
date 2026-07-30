@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { STAGE_ORDER, stageHref, type Stage } from "@/lib/chain";
+import { STAGE_ORDER, type Stage } from "@/lib/chain";
 import type { Asset } from "@/lib/store";
 
 const STEPS: { key: Stage; label: string }[] = [
@@ -20,22 +20,59 @@ interface StageStepperProps {
   chain?: Asset[];
 }
 
+const ARROW_BASE =
+  "flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-navy-50 text-cream-muted transition sm:h-8 sm:w-8";
+const ARROW_ENABLED = "hover:border-cream-muted hover:text-cream";
+const ARROW_DISABLED = "cursor-not-allowed opacity-40";
+
 export default function StageStepper({ current, chain }: StageStepperProps) {
   const currentIndex = STAGE_INDEX[current];
 
+  // Maps each stage to a direct link to its own asset (not stageHref, which
+  // resolves to "the input needed to redo this stage" — e.g. a sketch's
+  // stageHref is its parentId, not its own id). Iterating root-first means
+  // later (forward-walked) entries win, so each stage always points at its
+  // most current asset — the same asset each page's own "← Back" link would
+  // land you on, kept consistent here for the stepper's own circle-clicks
+  // and the prev/next arrows below.
   const hrefByStage = new Map<Stage, string>();
   if (chain) {
     for (const asset of chain) {
       const navStage = STAGE_ORDER.includes(asset.stage as Stage)
         ? (asset.stage as Stage)
         : "minibody"; // legacy "approval"/"done" rows
-      hrefByStage.set(navStage, stageHref(asset));
+      const routeStage = navStage === "garment" ? "sketch" : navStage;
+      hrefByStage.set(navStage, `/${routeStage}/${asset.id}`);
     }
   }
 
+  const prevHref =
+    currentIndex > 0 ? hrefByStage.get(STEPS[currentIndex - 1].key) : undefined;
+  const nextHref =
+    currentIndex < STEPS.length - 1
+      ? hrefByStage.get(STEPS[currentIndex + 1].key)
+      : undefined;
+
   return (
-    <nav aria-label="Pipeline stages" className="w-full">
-      <ol className="flex items-center gap-0">
+    <nav aria-label="Pipeline stages" className="flex w-full items-center gap-3">
+      {prevHref ? (
+        <Link
+          href={prevHref}
+          aria-label="Previous stage"
+          className={[ARROW_BASE, ARROW_ENABLED].join(" ")}
+        >
+          ‹
+        </Link>
+      ) : (
+        <span
+          aria-hidden
+          className={[ARROW_BASE, ARROW_DISABLED].join(" ")}
+        >
+          ‹
+        </span>
+      )}
+
+      <ol className="flex flex-1 items-center gap-0">
         {STEPS.map((step, index) => {
           const isComplete = index < currentIndex;
           const isCurrent = index === currentIndex;
@@ -46,12 +83,11 @@ export default function StageStepper({ current, chain }: StageStepperProps) {
               <div
                 className={[
                   "flex h-7 w-7 items-center justify-center rounded-full text-[10px] font-semibold transition-colors sm:h-8 sm:w-8 sm:text-xs",
-                  isComplete && "bg-accent-blue text-navy",
-                  isCurrent &&
-                    "bg-accent-orange text-navy ring-2 ring-accent-orange/40",
+                  isComplete && "bg-accent-blue text-cream",
+                  isCurrent && "bg-cream-muted text-navy",
                   !isComplete &&
                     !isCurrent &&
-                    "bg-navy-50 text-cream-muted",
+                    "border border-navy-50 bg-transparent text-cream-muted",
                 ]
                   .filter(Boolean)
                   .join(" ")}
@@ -98,6 +134,23 @@ export default function StageStepper({ current, chain }: StageStepperProps) {
           );
         })}
       </ol>
+
+      {nextHref ? (
+        <Link
+          href={nextHref}
+          aria-label="Next stage"
+          className={[ARROW_BASE, ARROW_ENABLED].join(" ")}
+        >
+          ›
+        </Link>
+      ) : (
+        <span
+          aria-hidden
+          className={[ARROW_BASE, ARROW_DISABLED].join(" ")}
+        >
+          ›
+        </span>
+      )}
     </nav>
   );
 }

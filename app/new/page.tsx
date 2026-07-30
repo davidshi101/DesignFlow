@@ -1,9 +1,12 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import StageStepper from "@/components/StageStepper";
-import type { Asset } from "@/lib/store";
+import AssetThumbPicker from "@/components/AssetThumbPicker";
+import type { Asset, AssetStage, AssetStatus } from "@/lib/store";
+import { startFromHref } from "@/lib/chain";
 
 function readFileAsDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -14,231 +17,283 @@ function readFileAsDataUrl(file: File): Promise<string> {
   });
 }
 
-type UploadKind = "garment" | "sketch";
+interface UploadCard {
+  key: string;
+  stage: AssetStage;
+  status: AssetStatus;
+  title: string;
+  description: string;
+}
+
+const PRIMARY_CARD: UploadCard = {
+  key: "garment",
+  stage: "garment",
+  status: "approved",
+  title: "Garment photo",
+  description:
+    "Starts at Line Sketch — AI converts your photo into a clean line-art flat.",
+};
+
+interface SecondaryCard {
+  key: string;
+  uploadStage: AssetStage;
+  status: AssetStatus;
+  title: string;
+  description: string;
+  uploadLabel: string;
+}
+
+const SECONDARY_CARDS: SecondaryCard[] = [
+  {
+    key: "cad",
+    uploadStage: "sketch",
+    status: "approved",
+    title: "Start from CAD",
+    description: "Upload a line sketch — opens CAD Fill empty.",
+    uploadLabel: "Upload line sketch",
+  },
+  {
+    key: "minibody",
+    uploadStage: "cad",
+    status: "approved",
+    title: "Start from Minibody",
+    description: "Upload a filled sketch — opens Minibody with generation empty.",
+    uploadLabel: "Upload filled sketch",
+  },
+];
 
 export default function NewDesignPage() {
   const router = useRouter();
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const [uploadKind, setUploadKind] = useState<UploadKind>("garment");
-  const [sketches, setSketches] = useState<Asset[]>([]);
-  const [loadingList, setLoadingList] = useState(true);
-  const [busy, setBusy] = useState(false);
+  const fileInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
+  const [busyCard, setBusyCard] = useState<string | null>(null);
+  const [dragCard, setDragCard] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [recentGarments, setRecentGarments] = useState<Asset[]>([]);
 
   useEffect(() => {
-    fetch("/api/assets")
-      .then((r) => r.json())
-      .then((data) => {
-        const all: Asset[] = data.assets ?? [];
-        setSketches(
-          all.filter(
-            (a) =>
-              a.stage === "sketch" && a.imageUrl && a.status !== "discarded"
-          )
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch("/api/assets");
+        const data = await res.json();
+        const assets: Asset[] = data.assets ?? [];
+        if (cancelled) return;
+        setRecentGarments(
+          assets
+            .filter((a) => a.stage === "garment" && a.status === "approved")
+            .sort(
+              (a, b) =>
+                new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+            )
         );
-        setLoadingList(false);
-      })
-      .catch(() => setLoadingList(false));
+      } catch {
+        // Convenience grid — silently skip on failure.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
-  async function createAsset(payload: {
-    stage: "garment" | "sketch";
-    status: "draft" | "approved";
-    imageUrl: string | null;
-    parentId?: string | null;
-    meta?: Record<string, unknown>;
+  async function createAndStart(opts: {
+    key: string;
+    stage: AssetStage;
+    status: AssetStatus;
+    file: File;
   }) {
-    const res = await fetch("/api/assets", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        stage: payload.stage,
-        status: payload.status,
-        parentId: payload.parentId ?? null,
-        imageUrl: payload.imageUrl,
-        meta: payload.meta ?? {},
-      }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "Failed to create asset");
-    return data.asset as Asset;
-  }
-
-  async function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    if (!file.type.startsWith("image/")) {
+    if (!opts.file.type.startsWith("image/")) {
       setError("Please choose an image file");
       return;
     }
-    setBusy(true);
+    setBusyCard(opts.key);
     setError(null);
     try {
-      const dataUrl = await readFileAsDataUrl(file);
-
-      if (uploadKind === "garment") {
-        const asset = await createAsset({
-          stage: "garment",
-          status: "draft",
+      const dataUrl = await readFileAsDataUrl(opts.file);
+      const res = await fetch("/api/assets", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          stage: opts.stage,
+          status: opts.status,
+          parentId: null,
           imageUrl: dataUrl,
-          meta: { source: "upload", fileName: file.name },
-        });
-        router.push(`/sketch/${asset.id}`);
-      } else {
-        const asset = await createAsset({
-          stage: "sketch",
-          status: "approved",
-          imageUrl: dataUrl,
-          meta: { source: "upload-sketch", fileName: file.name },
-        });
-        router.push(`/cad/${asset.id}`);
-      }
+          meta: {
+            source: opts.stage === "garment" ? "upload" : "upload-direct",
+            fileName: opts.file.name,
+          },
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Failed to create asset");
+      router.push(startFromHref(data.asset as Asset));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Upload failed");
-      setBusy(false);
+      setBusyCard(null);
     } finally {
-      if (fileInputRef.current) fileInputRef.current.value = "";
+      const input = fileInputRefs.current[opts.key];
+      if (input) input.value = "";
     }
   }
 
-  async function handlePickSketch(sketch: Asset) {
-    setBusy(true);
-    setError(null);
-    try {
-      // Reuse as a fresh draft to regenerate/tweak — mirrors "redo this
-      // stage" navigation elsewhere rather than skipping straight to CAD.
-      const asset = await createAsset({
-        stage: "sketch",
-        status: "draft",
-        imageUrl: sketch.imageUrl,
-        parentId: sketch.id,
-        meta: { source: "existing-sketch", parentId: sketch.id },
-      });
-      router.push(`/sketch/${asset.id}`);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Something went wrong");
-      setBusy(false);
-    }
-  }
+  const card = PRIMARY_CARD;
+  const busy = busyCard === card.key;
+  const dragging = dragCard === card.key;
 
   return (
-    <div className="mx-auto max-w-4xl space-y-8">
+    <div className="mx-auto max-w-5xl space-y-5">
       <StageStepper current="garment" />
 
       <div className="space-y-2">
+        <Link
+          href="/"
+          className="inline-flex items-center gap-1 text-xs font-medium text-cream-muted transition hover:text-cream"
+        >
+          ← back home
+        </Link>
         <h1 className="text-2xl font-semibold tracking-tight">Garment</h1>
         <p className="text-sm text-cream-muted">
-          Upload a photo or continue from an existing sketch.
+          Upload a garment photo to start the pipeline.
         </p>
       </div>
 
       {error && <p className="text-sm text-accent-orange">{error}</p>}
 
-      <div className="grid gap-6 md:grid-cols-2">
-        {/* Upload a photo or sketch */}
-        <section className="flex flex-col gap-4 rounded-lg border border-navy-50 bg-navy-100 p-6">
-          <div className="space-y-1">
-            <h2 className="text-lg font-medium">Upload an image</h2>
-            <p className="text-sm text-cream-muted">
-              Tell us what this image is so we route it to the right stage.
-            </p>
-          </div>
-
-          <fieldset className="space-y-2">
-            <legend className="sr-only">What is this image?</legend>
-            <label className="flex cursor-pointer items-start gap-2 rounded-md border border-navy-50 p-3 text-sm transition hover:border-accent-blue has-[:checked]:border-accent-blue has-[:checked]:bg-accent-blue/10">
-              <input
-                type="radio"
-                name="uploadKind"
-                value="garment"
-                checked={uploadKind === "garment"}
-                onChange={() => setUploadKind("garment")}
-                disabled={busy}
-                className="mt-0.5 accent-accent-blue"
-              />
-              <span>
-                <span className="block font-medium">Garment photo</span>
-                <span className="block text-xs text-cream-muted">
-                  Needs AI conversion into a line-art sketch first.
-                </span>
-              </span>
-            </label>
-            <label className="flex cursor-pointer items-start gap-2 rounded-md border border-navy-50 p-3 text-sm transition hover:border-accent-blue has-[:checked]:border-accent-blue has-[:checked]:bg-accent-blue/10">
-              <input
-                type="radio"
-                name="uploadKind"
-                value="sketch"
-                checked={uploadKind === "sketch"}
-                onChange={() => setUploadKind("sketch")}
-                disabled={busy}
-                className="mt-0.5 accent-accent-blue"
-              />
-              <span>
-                <span className="block font-medium">
-                  Already a line sketch
-                </span>
-                <span className="block text-xs text-cream-muted">
-                  Skips straight to CAD Fill — no AI conversion needed.
-                </span>
-              </span>
-            </label>
-          </fieldset>
-
+      <div className="mx-auto grid max-w-md gap-4">
+        <div
+          onDragOver={(e) => {
+            e.preventDefault();
+            setDragCard(card.key);
+          }}
+          onDragLeave={() => setDragCard((k) => (k === card.key ? null : k))}
+          onDrop={(e) => {
+            e.preventDefault();
+            setDragCard(null);
+            const file = e.dataTransfer.files?.[0];
+            if (file) {
+              createAndStart({
+                key: card.key,
+                stage: card.stage,
+                status: card.status,
+                file,
+              });
+            }
+          }}
+          onClick={() => fileInputRefs.current[card.key]?.click()}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              fileInputRefs.current[card.key]?.click();
+            }
+          }}
+          role="button"
+          tabIndex={0}
+          className={[
+            "flex cursor-pointer flex-col items-center gap-2 rounded-lg border border-dashed p-6 text-center transition",
+            dragging
+              ? "border-accent-blue bg-accent-blue/10"
+              : "border-navy-50 bg-navy-100 hover:border-cream-muted",
+          ].join(" ")}
+        >
+          <span className="flex h-10 w-10 items-center justify-center rounded-full bg-navy text-lg text-cream-muted">
+            ↑
+          </span>
+          <h2 className="text-base font-medium">{card.title}</h2>
+          <p className="text-xs text-cream-muted">
+            Drag and drop, or{" "}
+            <span className="text-accent-blue underline">browse files</span>
+          </p>
+          <p className="text-[11px] text-cream-muted">PNG or JPG up to 20MB</p>
+          <p className="max-w-[16rem] text-[11px] text-cream-muted">
+            {card.description}
+          </p>
           <input
-            ref={fileInputRef}
+            ref={(el) => {
+              fileInputRefs.current[card.key] = el;
+            }}
             type="file"
             accept="image/*"
-            disabled={busy}
-            onChange={handleFileChange}
-            className="block w-full text-sm text-cream-muted file:mr-3 file:rounded-md file:border-0 file:bg-accent-blue file:px-3 file:py-2 file:text-sm file:font-semibold file:text-navy hover:file:brightness-110 disabled:opacity-40"
+            disabled={busyCard !== null}
+            onClick={(e) => e.stopPropagation()}
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              if (file) {
+                createAndStart({
+                  key: card.key,
+                  stage: card.stage,
+                  status: card.status,
+                  file,
+                });
+              }
+            }}
+            className="hidden"
           />
-
-          {busy && (
-            <p className="text-xs text-cream-muted">Creating asset…</p>
-          )}
-        </section>
-
-        {/* Start from existing sketch */}
-        <section className="flex flex-col gap-4 rounded-lg border border-navy-50 bg-navy-100 p-6">
-          <div className="space-y-1">
-            <h2 className="text-lg font-medium">Start from an existing sketch</h2>
-            <p className="text-sm text-cream-muted">
-              Reuse a previous sketch as the base for a new draft — goes
-              straight to CAD Fill.
-            </p>
-          </div>
-
-          {loadingList ? (
-            <p className="text-sm text-cream-muted">Loading sketches…</p>
-          ) : sketches.length === 0 ? (
-            <p className="text-sm text-cream-muted">
-              No sketches yet. Upload a photo to create your first one.
-            </p>
-          ) : (
-            <div className="grid max-h-72 grid-cols-2 gap-3 overflow-y-auto sm:grid-cols-3">
-              {sketches.map((sketch) => (
-                <button
-                  key={sketch.id}
-                  type="button"
-                  disabled={busy}
-                  onClick={() => handlePickSketch(sketch)}
-                  className="group relative aspect-square overflow-hidden rounded-md border border-navy-50 bg-navy transition hover:border-accent-blue disabled:opacity-40"
-                >
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img
-                    src={sketch.imageUrl!}
-                    alt="Existing sketch"
-                    className="h-full w-full object-cover"
-                  />
-                  <span className="absolute inset-x-0 bottom-0 bg-navy/80 px-1 py-0.5 text-[10px] text-cream-muted opacity-0 transition group-hover:opacity-100">
-                    Use this
-                  </span>
-                </button>
-              ))}
-            </div>
-          )}
-        </section>
+          {busy && <p className="text-xs text-cream-muted">Creating asset…</p>}
+        </div>
       </div>
+
+      {recentGarments.length > 0 && (
+        <section className="space-y-2">
+          <h2 className="text-xs font-medium uppercase tracking-wider text-cream-muted">
+            Previous garments
+          </h2>
+          <p className="text-xs text-cream-muted">
+            Start a new design from a library garment — opens Line Sketch with
+            generation empty.
+          </p>
+          <AssetThumbPicker
+            assets={recentGarments}
+            onSelect={(nextId) => {
+              if (!nextId) return;
+              const asset = recentGarments.find((g) => g.id === nextId);
+              if (asset) router.push(startFromHref(asset));
+            }}
+          />
+        </section>
+      )}
+
+      <section className="space-y-3 rounded-lg border border-navy-50 p-4">
+        <h2 className="text-sm font-medium text-cream-muted">
+          Already further along?
+        </h2>
+        <div className="grid gap-4 sm:grid-cols-2">
+          {SECONDARY_CARDS.map((sec) => (
+            <section
+              key={sec.key}
+              className="flex flex-col gap-3 rounded-lg border border-navy-50 bg-navy-100 p-4"
+            >
+              <div className="space-y-1">
+                <h3 className="text-sm font-medium">{sec.title}</h3>
+                <p className="text-xs text-cream-muted">{sec.description}</p>
+              </div>
+              <label className="inline-flex cursor-pointer items-center self-start">
+                <span className="rounded-md bg-accent-blue px-3 py-2 text-sm font-semibold text-navy transition hover:brightness-110">
+                  {busyCard === sec.key ? "Uploading…" : sec.uploadLabel}
+                </span>
+                <input
+                  ref={(el) => {
+                    fileInputRefs.current[sec.key] = el;
+                  }}
+                  type="file"
+                  accept="image/*"
+                  disabled={busyCard !== null}
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    if (file) {
+                      createAndStart({
+                        key: sec.key,
+                        stage: sec.uploadStage,
+                        status: sec.status,
+                        file,
+                      });
+                    }
+                  }}
+                  className="sr-only"
+                />
+              </label>
+            </section>
+          ))}
+        </div>
+      </section>
     </div>
   );
 }

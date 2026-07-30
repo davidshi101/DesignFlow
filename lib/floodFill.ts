@@ -82,6 +82,61 @@ export function floodFillToMask(
   return filled;
 }
 
+/**
+ * Flood-clear from (sx, sy) over the MASK's own already-filled pixels
+ * (connectivity comes from the mask itself, not the sketch) — the inverse of
+ * floodFillToMask, for "click a filled region to remove it." Returns number
+ * of pixels cleared (0 if the seed wasn't filled).
+ */
+export function floodClearMask(
+  mask: ImageData,
+  sx: number,
+  sy: number
+): number {
+  const { width: w, height: h } = mask;
+  if (sx < 0 || sy < 0 || sx >= w || sy >= h) return 0;
+
+  const msk = mask.data;
+  const start = (sy * w + sx) * 4;
+  if (msk[start + 3] <= 128) return 0;
+
+  const visited = new Uint8Array(w * h);
+  const queue: number[] = [sx, sy];
+  let head = 0;
+  visited[sy * w + sx] = 1;
+  let cleared = 0;
+
+  while (head < queue.length) {
+    const x = queue[head++];
+    const y = queue[head++];
+    const i = (y * w + x) * 4;
+
+    if (msk[i + 3] <= 128) continue;
+
+    msk[i] = 0;
+    msk[i + 1] = 0;
+    msk[i + 2] = 0;
+    msk[i + 3] = 0;
+    cleared++;
+
+    const neighbors = [
+      [x + 1, y],
+      [x - 1, y],
+      [x, y + 1],
+      [x, y - 1],
+    ];
+    for (const [nx, ny] of neighbors) {
+      if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+      const ni = ny * w + nx;
+      if (visited[ni]) continue;
+      visited[ni] = 1;
+      queue.push(nx, ny);
+    }
+  }
+
+  return cleared;
+}
+
 export function maskHasContent(mask: ImageData): boolean {
   const d = mask.data;
   for (let i = 3; i < d.length; i += 4) {

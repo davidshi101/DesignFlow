@@ -1,9 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
-import { createAsset, getAsset } from "@/lib/store";
-import { generateMinibody, parseDataUrl } from "@/lib/gemini";
+import { createAsset, getAsset, getAssetImageBuffer } from "@/lib/store";
+import { generateMinibody } from "@/lib/gemini";
 import { DEFAULT_MINIBODY_PROMPT } from "@/lib/prompts";
 
-export const maxDuration = 60;
+export const maxDuration = 90;
 
 export async function POST(req: NextRequest) {
   try {
@@ -32,10 +32,20 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const { mimeType, base64 } = parseDataUrl(source.imageUrl);
+    const image = await getAssetImageBuffer(assetId);
+    if (!image) {
+      return NextResponse.json(
+        { error: "Source asset's image file is missing on disk" },
+        { status: 400 }
+      );
+    }
     const prompt = promptText?.trim() || DEFAULT_MINIBODY_PROMPT;
 
-    const imageUrl = await generateMinibody(base64, mimeType, prompt);
+    const imageUrl = await generateMinibody(
+      image.buffer.toString("base64"),
+      image.mimeType,
+      prompt
+    );
 
     const asset = await createAsset({
       stage: "minibody",

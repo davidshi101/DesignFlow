@@ -1,26 +1,74 @@
 [
   {
-    "id": "floral",
-    "label": "Floral",
-    "src": "/prints/floral.png",
+    "id": "black",
+    "label": "Black",
+    "src": "/prints/black.svg",
     "createdAt": "2026-07-28T16:38:26.967Z"
   },
   {
-    "id": "stripe",
-    "label": "Stripe",
-    "src": "/prints/stripe.png",
+    "id": "white",
+    "label": "White",
+    "src": "/prints/white.svg",
     "createdAt": "2026-07-28T16:38:26.967Z"
   },
   {
-    "id": "check",
-    "label": "Check",
-    "src": "/prints/check.png",
+    "id": "pattern",
+    "label": "Pattern",
+    "src": "/prints/pattern.svg",
     "createdAt": "2026-07-28T16:38:26.967Z"
   },
   {
-    "id": "dots",
-    "label": "Dots",
-    "src": "/prints/dots.png",
+    "id": "word",
+    "label": "Word mark",
+    "src": "/prints/word.svg",
     "createdAt": "2026-07-28T16:38:26.967Z"
+  },
+  {
+    "id": "5aae3204-4956-4c0c-9035-e547babe6c72",
+    "label": "Pink V-Neck Tunic",
+    "src": "/prints/ww-1.jpg",
+    "createdAt": "2026-07-29T03:30:22.335Z"
+  },
+  {
+    "id": "3fdad015-24a9-4465-aaaa-ab40c3735052",
+    "label": "Floral Crewneck Tee",
+    "src": "/prints/ww-2.jpg",
+    "createdAt": "2026-07-29T03:30:22.335Z"
+  },
+  {
+    "id": "86cec3b6-8cf3-44cd-b396-4dc13f41493f",
+    "label": "Purple V-Neck Tee",
+    "src": "/prints/ww-3.jpg",
+    "createdAt": "2026-07-29T03:30:22.335Z"
+  },
+  {
+    "id": "8cd108e0-292a-451c-830d-a73f2d5107c5",
+    "label": "Blue Crewneck Tee",
+    "src": "/prints/ww-4.jpg",
+    "createdAt": "2026-07-29T03:30:22.335Z"
+  },
+  {
+    "id": "4b93ba58-4cac-49ac-86c6-716bd889b707",
+    "label": "Knit Shirt Dress",
+    "src": "/prints/ww-5.jpg",
+    "createdAt": "2026-07-29T03:30:22.335Z"
+  },
+  {
+    "id": "c44b66c3-bcd9-4c22-b2d6-591ebb4ddc21",
+    "label": "Crewneck Tee Dress",
+    "src": "/prints/ww-6.jpg",
+    "createdAt": "2026-07-29T03:30:22.335Z"
+  },
+  {
+    "id": "72d1d223-beee-4de6-96bd-9112cd7d3283",
+    "label": "Pintucked Sleeveless Dress",
+    "src": "/prints/ww-7.jpg",
+    "createdAt": "2026-07-29T03:30:22.335Z"
+  },
+  {
+    "id": "4a88e0d5-6081-49ab-a091-f09e598ec4fd",
+    "label": "V-Neck Tee Dress",
+    "src": "/prints/ww-8.jpg",
+    "createdAt": "2026-07-29T03:30:22.335Z"
   }
 ]

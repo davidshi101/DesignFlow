@@ -84,6 +84,48 @@ export function stageHref(asset: Asset): string {
   }
 }
 
+/**
+ * Route for starting a *new* design from an existing library asset — jumps
+ * to the next pipeline stage with generation empty (`?fresh=1` where the
+ * stage page would otherwise tip to an existing downstream child).
+ *
+ * garment → Line Sketch, sketch → CAD Fill, CAD → Minibody, minibody → Review.
+ */
+export function startFromHref(asset: Asset): string {
+  switch (toNavStage(asset.stage)) {
+    case "garment":
+      return `/sketch/${asset.id}?fresh=1`;
+    case "sketch":
+      return `/cad/${asset.id}`;
+    case "cad":
+      return `/minibody/${asset.id}?fresh=1`;
+    case "minibody":
+      return `/review/${asset.id}`;
+  }
+}
+
+/** Furthest pipeline asset in a design row — used for Resume. */
+export interface DesignProgress {
+  garment?: Asset | null;
+  sketch?: Asset | null;
+  cad?: Asset | null;
+  minibody?: Asset | null;
+}
+
+/**
+ * Where to send "Resume" for a recent design: the furthest stage that already
+ * has an asset, opened by that asset's own id (stage pages support own-stage
+ * ids as iterable). Falls back to garment → Line Sketch when nothing has
+ * been generated yet.
+ */
+export function resumeHref(design: DesignProgress): string | null {
+  if (design.minibody) return `/minibody/${design.minibody.id}`;
+  if (design.cad) return `/cad/${design.cad.id}`;
+  if (design.sketch) return `/sketch/${design.sketch.id}`;
+  if (design.garment) return `/sketch/${design.garment.id}`;
+  return null;
+}
+
 export function stageIndex(stage: AssetStage): number {
   return STAGE_ORDER.indexOf(toNavStage(stage));
 }

@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import localFont from "next/font/local";
+import WelcomeGate from "@/components/WelcomeGate";
 import "./globals.css";
 
 const geistSans = localFont({
@@ -30,12 +31,14 @@ export default function RootLayout({
         className={`${geistSans.variable} ${geistMono.variable} bg-navy text-cream antialiased`}
       >
         <div className="min-h-screen flex flex-col">
-          <header className="border-b border-navy-50 px-6 py-4">
+          <header className="border-b border-navy-50 px-6 py-3">
             <a href="/" className="text-lg font-semibold tracking-tight text-cream">
               DesignFlow<span className="text-accent-blue"> AI</span>
             </a>
           </header>
-          <main className="flex-1 px-6 py-8">{children}</main>
+          <main className="flex-1 px-6 py-5">
+            <WelcomeGate>{children}</WelcomeGate>
+          </main>
         </div>
       </body>
     </html>
