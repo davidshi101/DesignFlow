@@ -7,8 +7,7 @@
  * only has product photography, not technical flats, so the same simple
  * on-white product shots stand in for both.
  *
- * Self-contained (no @/lib imports) so it runs standalone via `npx tsx`,
- * matching scripts/migrate-storage.ts's convention.
+ * Self-contained (no @/lib imports) so it runs standalone via `npx tsx`.
  *
  * Usage: npx tsx scripts/seed-sample-library.ts
  */
